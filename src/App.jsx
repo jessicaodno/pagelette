@@ -11,6 +11,7 @@ import {
   Heart,
   Star,
   ArrowLeft,
+  UserRound,
 } from 'lucide-react'
 
 import {
@@ -187,6 +188,384 @@ function loadBooks() {
   }
 }
 
+function cloudRowToBook(
+  row,
+  localBook = null
+) {
+  return normalizeBook({
+    ...(localBook || {}),
+
+    key:
+      row.book_key,
+
+    title:
+      row.title,
+
+    author:
+      row.author ||
+      localBook?.author ||
+      'Unknown author',
+
+    cover:
+      row.cover ||
+      localBook?.cover ||
+      null,
+
+    year:
+      row.publish_year ||
+      localBook?.year ||
+      null,
+
+    shelf:
+      row.shelf ||
+      'Want to Read',
+
+    favorite:
+      Boolean(
+        row.favorite
+      ),
+
+    rating:
+      Number(
+        row.rating
+      ) || 0,
+
+    pagesRead:
+      row.pages_read ??
+      '',
+
+    totalPages:
+      row.total_pages ??
+      localBook?.totalPages ??
+      '',
+
+    startedDate:
+      row.started_date ||
+      '',
+
+    finishedDate:
+      row.finished_date ||
+      '',
+
+    // Reviews and quotes already have their own Pagelette
+    // storage/features, so keep any local copies intact.
+    review:
+      localBook?.review ||
+      '',
+
+    reviewUpdatedAt:
+      localBook?.reviewUpdatedAt ||
+      '',
+
+    quotes:
+      localBook?.quotes ||
+      [],
+  })
+}
+
+async function upsertBooksToCloud(
+  userId,
+  books
+) {
+  if (!userId) {
+    return
+  }
+
+  const rows =
+    books.map((book) => ({
+      user_id:
+        userId,
+
+      book_key:
+        book.key,
+
+      title:
+        book.title,
+
+      author:
+        book.author ||
+        '',
+
+      cover:
+        book.cover ||
+        null,
+
+      publish_year:
+        book.year
+          ? Number(
+              book.year
+            ) || null
+          : null,
+
+      shelf:
+        book.shelf ||
+        'Want to Read',
+
+      favorite:
+        Boolean(
+          book.favorite
+        ),
+
+      rating:
+        Number(
+          book.rating
+        ) || 0,
+
+      pages_read:
+        Number(
+          book.pagesRead
+        ) || 0,
+
+      total_pages:
+        book.totalPages ===
+          '' ||
+        book.totalPages == null
+          ? null
+          : Number(
+              book.totalPages
+            ) || null,
+
+      started_date:
+        book.startedDate ||
+        null,
+
+      finished_date:
+        book.finishedDate ||
+        null,
+
+      updated_at:
+        new Date()
+          .toISOString(),
+    }))
+
+  if (rows.length > 0) {
+    const { error } =
+      await supabase
+        .from('user_books')
+        .upsert(
+          rows,
+          {
+            onConflict:
+              'user_id,book_key',
+          }
+        )
+
+    if (error) {
+      throw error
+    }
+  }
+}
+
+async function syncCloudSnapshot(
+  userId,
+  books
+) {
+  if (!userId) {
+    return
+  }
+
+  try {
+    await upsertBooksToCloud(
+      userId,
+      books
+    )
+
+    const {
+      data: cloudRows,
+      error: loadError,
+    } =
+      await supabase
+        .from('user_books')
+        .select(
+          'book_key'
+        )
+        .eq(
+          'user_id',
+          userId
+        )
+
+    if (loadError) {
+      throw loadError
+    }
+
+    const localKeys =
+      new Set(
+        books.map(
+          (book) =>
+            book.key
+        )
+      )
+
+    const removedKeys =
+      (cloudRows || [])
+        .map(
+          (row) =>
+            row.book_key
+        )
+        .filter(
+          (bookKey) =>
+            !localKeys.has(
+              bookKey
+            )
+        )
+
+    for (
+      const bookKey of
+      removedKeys
+    ) {
+      const { error } =
+        await supabase
+          .from('user_books')
+          .delete()
+          .eq(
+            'user_id',
+            userId
+          )
+          .eq(
+            'book_key',
+            bookKey
+          )
+
+      if (error) {
+        throw error
+      }
+    }
+  } catch (error) {
+    console.error(
+      'Cloud library sync error:',
+      error
+    )
+  }
+}
+
+async function hydrateLibraryFromCloud(
+  userId
+) {
+  if (!userId) {
+    return
+  }
+
+  const localBooks =
+    loadBooks()
+
+  try {
+    const {
+      data: cloudRows,
+      error,
+    } =
+      await supabase
+        .from('user_books')
+        .select('*')
+        .eq(
+          'user_id',
+          userId
+        )
+        .order(
+          'created_at',
+          {
+            ascending: true,
+          }
+        )
+
+    if (error) {
+      throw error
+    }
+
+    const rows =
+      cloudRows || []
+
+    // First migration: this account has browser books but
+    // no cloud library yet. Upload without deleting anything.
+    if (
+      rows.length === 0 &&
+      localBooks.length > 0
+    ) {
+      await upsertBooksToCloud(
+        userId,
+        localBooks
+      )
+
+      return
+    }
+
+    if (rows.length === 0) {
+      return
+    }
+
+    const localByKey =
+      new Map(
+        localBooks.map(
+          (book) => [
+            book.key,
+            book,
+          ]
+        )
+      )
+
+    const cloudBooks =
+      rows.map((row) =>
+        cloudRowToBook(
+          row,
+          localByKey.get(
+            row.book_key
+          ) || null
+        )
+      )
+
+    const cloudKeys =
+      new Set(
+        cloudBooks.map(
+          (book) =>
+            book.key
+        )
+      )
+
+    // Preserve books that exist only in this browser, then
+    // upload them so neither device loses anything.
+    const localOnlyBooks =
+      localBooks.filter(
+        (book) =>
+          !cloudKeys.has(
+            book.key
+          )
+      )
+
+    const mergedBooks = [
+      ...cloudBooks,
+      ...localOnlyBooks,
+    ]
+
+    localStorage.setItem(
+      scopedStorageKey(
+        'jessicasBooks'
+      ),
+      JSON.stringify(
+        mergedBooks
+      )
+    )
+
+    if (
+      localOnlyBooks.length > 0
+    ) {
+      await upsertBooksToCloud(
+        userId,
+        localOnlyBooks
+      )
+    }
+
+    window.dispatchEvent(
+      new Event(
+        'booksUpdated'
+      )
+    )
+  } catch (error) {
+    console.error(
+      'Could not load cloud library:',
+      error
+    )
+  }
+}
+
 function saveBooksToStorage(
   books
 ) {
@@ -200,6 +579,341 @@ function saveBooksToStorage(
   window.dispatchEvent(
     new Event('booksUpdated')
   )
+
+  const userId =
+    localStorage.getItem(
+      ACTIVE_USER_KEY
+    )
+
+  if (userId) {
+    // Keep the UI instant; cloud syncing happens in the
+    // background after the browser copy has been saved.
+    void syncCloudSnapshot(
+      userId,
+      books
+    )
+  }
+}
+
+async function createActivity(
+  userId,
+  activityType,
+  book,
+  metadata = {}
+) {
+  if (
+    !userId ||
+    !activityType ||
+    !book?.key
+  ) {
+    return
+  }
+
+  try {
+    const {
+      error,
+    } =
+      await supabase
+        .from('activities')
+        .insert({
+          user_id:
+            userId,
+
+          activity_type:
+            activityType,
+
+          book_key:
+            book.key,
+
+          book_title:
+            book.title ||
+            'Untitled',
+
+          metadata: {
+            author:
+              book.author ||
+              '',
+
+            cover:
+              book.cover ||
+              null,
+
+            rating:
+              Number(
+                book.rating
+              ) || 0,
+
+            ...metadata,
+          },
+        })
+
+    if (error) {
+      throw error
+    }
+  } catch (error) {
+    console.error(
+      'Could not save activity:',
+      error
+    )
+  }
+}
+
+async function hydrateReviewsWithLikes(
+  reviews,
+  userId
+) {
+  const cleanReviews =
+    Array.isArray(reviews)
+      ? reviews
+      : []
+
+  if (
+    cleanReviews.length ===
+    0
+  ) {
+    return []
+  }
+
+  const reviewIds =
+    cleanReviews.map(
+      (review) =>
+        review.id
+    )
+
+  const reviewerIds =
+    Array.from(
+      new Set(
+        cleanReviews
+          .map(
+            (review) =>
+              review.user_id
+          )
+          .filter(Boolean)
+      )
+    )
+
+  try {
+    const [
+      likesResult,
+      profilesResult,
+    ] =
+      await Promise.all([
+        supabase
+          .from('review_likes')
+          .select(
+            'review_id, user_id'
+          )
+          .in(
+            'review_id',
+            reviewIds
+          ),
+
+        reviewerIds.length > 0
+          ? supabase
+              .from('profiles')
+              .select(
+                'id, display_name, username, avatar_url'
+              )
+              .in(
+                'id',
+                reviewerIds
+              )
+          : Promise.resolve({
+              data: [],
+              error: null,
+            }),
+      ])
+
+    if (
+      likesResult.error
+    ) {
+      throw (
+        likesResult.error
+      )
+    }
+
+    if (
+      profilesResult.error
+    ) {
+      throw (
+        profilesResult.error
+      )
+    }
+
+    const likes =
+      likesResult.data ||
+      []
+
+    const profiles =
+      new Map(
+        (
+          profilesResult.data ||
+          []
+        ).map(
+          (profile) => [
+            profile.id,
+            profile,
+          ]
+        )
+      )
+
+    return cleanReviews.map(
+      (review) => {
+        const reviewLikes =
+          likes.filter(
+            (like) =>
+              like.review_id ===
+              review.id
+          )
+
+        const reviewerProfile =
+          profiles.get(
+            review.user_id
+          )
+
+        return {
+          ...review,
+
+          reviewer_name:
+            reviewerProfile
+              ?.display_name ||
+            review.reviewer_name ||
+            reviewerProfile
+              ?.username ||
+            'Reader',
+
+          reviewer_avatar_url:
+            reviewerProfile
+              ?.avatar_url ||
+            '',
+
+          like_count:
+            reviewLikes.length,
+
+          is_liked:
+            Boolean(
+              userId &&
+              reviewLikes.some(
+                (like) =>
+                  like.user_id ===
+                  userId
+              )
+            ),
+        }
+      }
+    )
+  } catch (error) {
+    console.error(
+      'Could not load review likes or reviewer profiles:',
+      error
+    )
+
+    return cleanReviews.map(
+      (review) => ({
+        ...review,
+
+        reviewer_avatar_url:
+          '',
+
+        like_count: 0,
+
+        is_liked: false,
+      })
+    )
+  }
+}
+
+async function setReviewLike(
+  reviewId,
+  userId,
+  shouldLike
+) {
+  if (
+    !reviewId ||
+    !userId
+  ) {
+    return false
+  }
+
+  try {
+    if (shouldLike) {
+      const {
+        error,
+      } =
+        await supabase
+          .from('review_likes')
+          .insert({
+            review_id:
+              reviewId,
+
+            user_id:
+              userId,
+          })
+
+      if (error) {
+        throw error
+      }
+    } else {
+      const {
+        error,
+      } =
+        await supabase
+          .from('review_likes')
+          .delete()
+          .eq(
+            'review_id',
+            reviewId
+          )
+          .eq(
+            'user_id',
+            userId
+          )
+
+      if (error) {
+        throw error
+      }
+    }
+
+    return true
+  } catch (error) {
+    console.error(
+      'Could not update review like:',
+      error
+    )
+
+    return false
+  }
+}
+
+function activityTypeForShelf(
+  shelf
+) {
+  if (
+    shelf ===
+    'Currently Reading'
+  ) {
+    return 'started'
+  }
+
+  if (
+    shelf ===
+    'Finished'
+  ) {
+    return 'finished'
+  }
+
+  if (
+    shelf ===
+    'Want to Read'
+  ) {
+    return 'want_to_read'
+  }
+
+  if (shelf === 'DNF') {
+    return 'dnf'
+  }
+
+  return null
 }
 
 function todayString() {
@@ -667,6 +1381,11 @@ function Layout({
     setShowProfileMenu,
   ] = useState(false)
 
+  const [
+    ownAvatarUrl,
+    setOwnAvatarUrl,
+  ] = useState('')
+
   const profileMenuRef =
     useRef(null)
 
@@ -699,6 +1418,83 @@ function Layout({
       )
     }
   }, [showProfileMenu])
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadOwnAvatar() {
+      if (!user?.id) {
+        setOwnAvatarUrl('')
+        return
+      }
+
+      try {
+        const {
+          data,
+          error,
+        } =
+          await supabase
+            .from('profiles')
+            .select(
+              'avatar_url'
+            )
+            .eq(
+              'id',
+              user.id
+            )
+            .maybeSingle()
+
+        if (error) {
+          throw error
+        }
+
+        if (!cancelled) {
+          setOwnAvatarUrl(
+            data?.avatar_url ||
+            ''
+          )
+        }
+      } catch (error) {
+        console.error(
+          'Could not load profile avatar:',
+          error
+        )
+      }
+    }
+
+    loadOwnAvatar()
+
+    function handleProfileUpdated(
+      event
+    ) {
+      if (
+        event.detail?.userId ===
+        user?.id
+      ) {
+        setOwnAvatarUrl(
+          event.detail
+            ?.avatarUrl ||
+          ''
+        )
+      } else {
+        loadOwnAvatar()
+      }
+    }
+
+    window.addEventListener(
+      'profileUpdated',
+      handleProfileUpdated
+    )
+
+    return () => {
+      cancelled = true
+
+      window.removeEventListener(
+        'profileUpdated',
+        handleProfileUpdated
+      )
+    }
+  }, [user?.id])
 
   const [
     searchQuery,
@@ -743,15 +1539,54 @@ function Layout({
 
   const searchResults =
     query
-      ? books.filter(
-          (book) =>
-            book.title
-              ?.toLowerCase()
-              .includes(query) ||
-            book.author
-              ?.toLowerCase()
-              .includes(query)
-        )
+      ? books
+          .filter(
+            (book) =>
+              book.title
+                ?.toLowerCase()
+                .includes(query)
+          )
+          .sort(
+            (a, b) => {
+              const aTitle =
+                a.title
+                  ?.toLowerCase() ||
+                ''
+
+              const bTitle =
+                b.title
+                  ?.toLowerCase() ||
+                ''
+
+              const aStarts =
+                aTitle.startsWith(
+                  query
+                )
+
+              const bStarts =
+                bTitle.startsWith(
+                  query
+                )
+
+              if (
+                aStarts &&
+                !bStarts
+              ) {
+                return -1
+              }
+
+              if (
+                !aStarts &&
+                bStarts
+              ) {
+                return 1
+              }
+
+              return aTitle.localeCompare(
+                bTitle
+              )
+            }
+          )
       : []
 
   function openBook(book) {
@@ -1035,11 +1870,24 @@ function Layout({
     )
   }
 >
-  <span className="avatar-letter">
-    {user.name
-      .charAt(0)
-      .toUpperCase()}
-  </span>
+  {ownAvatarUrl ? (
+    <img
+      className="avatar-image"
+      src={
+        ownAvatarUrl
+      }
+      alt={
+        user.name ||
+        'Profile'
+      }
+    />
+  ) : (
+    <span className="avatar-letter">
+      {user.name
+        .charAt(0)
+        .toUpperCase()}
+    </span>
+  )}
 </button>
 
               {showProfileMenu && (
@@ -1051,6 +1899,20 @@ function Layout({
                   <span>
                     {user.email}
                   </span>
+
+                  <button
+                    onClick={() => {
+                      setShowProfileMenu(
+                        false
+                      )
+
+                      navigate(
+                        '/profile'
+                      )
+                    }}
+                  >
+                    View profile
+                  </button>
 
                   <button
                     onClick={
@@ -1097,6 +1959,185 @@ function HomePage({
 
   const [books, setBooks] =
     useState(loadBooks)
+
+  const [
+    followingActivity,
+    setFollowingActivity,
+  ] = useState([])
+
+  const [
+    followingActivityLoading,
+    setFollowingActivityLoading,
+  ] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadFollowingActivity() {
+      if (!user?.id) {
+        return
+      }
+
+      setFollowingActivityLoading(
+        true
+      )
+
+      try {
+        const {
+          data:
+            followRows,
+          error:
+            followsError,
+        } =
+          await supabase
+            .from('follows')
+            .select(
+              'following_id'
+            )
+            .eq(
+              'follower_id',
+              user.id
+            )
+
+        if (followsError) {
+          throw followsError
+        }
+
+        const followingIds =
+          (followRows || [])
+            .map(
+              (row) =>
+                row.following_id
+            )
+            .filter(Boolean)
+
+        if (
+          followingIds.length ===
+          0
+        ) {
+          if (!cancelled) {
+            setFollowingActivity(
+              []
+            )
+          }
+
+          return
+        }
+
+        const [
+          activityResult,
+          profileResult,
+        ] =
+          await Promise.all([
+            supabase
+              .from(
+                'activities'
+              )
+              .select(
+                'id, user_id, activity_type, book_key, book_title, metadata, created_at'
+              )
+              .in(
+                'user_id',
+                followingIds
+              )
+              .order(
+                'created_at',
+                {
+                  ascending:
+                    false,
+                }
+              )
+              .limit(12),
+
+            supabase
+              .from(
+                'profiles'
+              )
+              .select(
+                'id, username, display_name, avatar_url'
+              )
+              .in(
+                'id',
+                followingIds
+              ),
+          ])
+
+        if (
+          activityResult.error
+        ) {
+          throw (
+            activityResult.error
+          )
+        }
+
+        if (
+          profileResult.error
+        ) {
+          throw (
+            profileResult.error
+          )
+        }
+
+        const profiles =
+          new Map(
+            (
+              profileResult.data ||
+              []
+            ).map(
+              (profile) => [
+                profile.id,
+                profile,
+              ]
+            )
+          )
+
+        const merged =
+          (
+            activityResult.data ||
+            []
+          ).map(
+            (activity) => ({
+              ...activity,
+
+              profile:
+                profiles.get(
+                  activity.user_id
+                ) ||
+                null,
+            })
+          )
+
+        if (!cancelled) {
+          setFollowingActivity(
+            merged
+          )
+        }
+      } catch (error) {
+        console.error(
+          'Could not load following activity:',
+          error
+        )
+
+        if (!cancelled) {
+          setFollowingActivity(
+            []
+          )
+        }
+      } finally {
+        if (!cancelled) {
+          setFollowingActivityLoading(
+            false
+          )
+        }
+      }
+    }
+
+    loadFollowingActivity()
+
+    return () => {
+      cancelled = true
+    }
+  }, [user?.id])
 
   useEffect(() => {
     function refreshBooks() {
@@ -1494,6 +2535,58 @@ function HomePage({
     }
 
     reader.readAsDataURL(file)
+  }
+
+  function followingActivityText(
+    activity
+  ) {
+    const name =
+      activity.profile
+        ?.display_name ||
+      activity.profile
+        ?.username ||
+      'A reader'
+
+    const title =
+      activity.book_title ||
+      'a book'
+
+    if (
+      activity.activity_type ===
+      'started'
+    ) {
+      return `${name} started reading ${title}`
+    }
+
+    if (
+      activity.activity_type ===
+      'finished'
+    ) {
+      return `${name} finished ${title}`
+    }
+
+    if (
+      activity.activity_type ===
+      'want_to_read'
+    ) {
+      return `${name} added ${title} to Want to Read`
+    }
+
+    if (
+      activity.activity_type ===
+      'reviewed'
+    ) {
+      return `${name} reviewed ${title}`
+    }
+
+    if (
+      activity.activity_type ===
+      'dnf'
+    ) {
+      return `${name} marked ${title} as DNF`
+    }
+
+    return `${name} updated ${title}`
   }
 
   return (
@@ -2118,6 +3211,173 @@ function HomePage({
           </div>
         </div>
       </section>
+
+      <section className="following-feed-card">
+        <div className="following-feed-heading">
+          <div>
+            <p className="eyebrow">
+              your reading circle
+            </p>
+
+            <h2>
+              Following Activity
+            </h2>
+          </div>
+
+          <span>
+            updates from readers
+            you follow
+          </span>
+        </div>
+
+        {followingActivityLoading ? (
+          <div className="following-feed-empty">
+            <BookOpen
+              size={25}
+            />
+
+            <p>
+              Loading your reading
+              circle...
+            </p>
+          </div>
+        ) : followingActivity.length >
+        0 ? (
+          <div className="following-feed-list">
+            {followingActivity.map(
+              (activity) => {
+                const name =
+                  activity.profile
+                    ?.display_name ||
+                  activity.profile
+                    ?.username ||
+                  'Reader'
+
+                const initial =
+                  name
+                    .charAt(0)
+                    .toUpperCase()
+
+                return (
+                  <article
+                    className="following-feed-item"
+                    key={
+                      activity.id
+                    }
+                  >
+                    <button
+                      type="button"
+                      className="following-feed-avatar"
+                      onClick={() =>
+                        navigate(
+                          `/profile/${activity.user_id}`
+                        )
+                      }
+                    >
+                      {activity.profile
+                        ?.avatar_url ? (
+                        <img
+                          src={
+                            activity
+                              .profile
+                              .avatar_url
+                          }
+                          alt={
+                            name
+                          }
+                        />
+                      ) : (
+                        <span>
+                          {
+                            initial
+                          }
+                        </span>
+                      )}
+                    </button>
+
+                    <div className="following-feed-copy">
+                      <button
+                        type="button"
+                        className="following-feed-text"
+                        onClick={() =>
+                          navigate(
+                            `/discover/${encodeURIComponent(
+                              activity.book_key
+                            )}`
+                          )
+                        }
+                      >
+                        {followingActivityText(
+                          activity
+                        )}
+                      </button>
+
+                      <span>
+                        {formatDate(
+                          activity.created_at
+                        )}
+                      </span>
+                    </div>
+
+                    {activity.activity_type ===
+                      'reviewed' &&
+                      Number(
+                        activity
+                          .metadata
+                          ?.rating
+                      ) > 0 && (
+                        <div className="following-feed-stars">
+                          {[1, 2, 3, 4, 5].map(
+                            (
+                              star
+                            ) => (
+                              <Star
+                                key={
+                                  star
+                                }
+                                size={
+                                  13
+                                }
+                                fill={
+                                  star <=
+                                  Number(
+                                    activity
+                                      .metadata
+                                      ?.rating ||
+                                      0
+                                  )
+                                    ? 'currentColor'
+                                    : 'none'
+                                }
+                              />
+                            )
+                          )}
+                        </div>
+                      )}
+                  </article>
+                )
+              }
+            )}
+          </div>
+        ) : (
+          <div className="following-feed-empty">
+            <UserRound
+              size={26}
+            />
+
+            <h3>
+              Your reading circle
+              is quiet
+            </h3>
+
+            <p>
+              Follow other Pagelette
+              readers to see what
+              they're reading here.
+            </p>
+          </div>
+        )}
+      </section>
     </>
   )
 }
@@ -2126,7 +3386,7 @@ function HomePage({
    MY BOOKS
 ===================================================== */
 
-function MyBooksPage() {
+function MyBooksPage({ user }) {
   const navigate =
     useNavigate()
 
@@ -2154,27 +3414,164 @@ function MyBooksPage() {
     setMyBooks,
   ] = useState(loadBooks)
 
+  const [
+    customShelves,
+    setCustomShelves,
+  ] = useState([])
+
+  const [
+    customShelfBooks,
+    setCustomShelfBooks,
+  ] = useState([])
+
+  const [
+    newShelfName,
+    setNewShelfName,
+  ] = useState('')
+
+  const [
+    shelfSaving,
+    setShelfSaving,
+  ] = useState(false)
+
+  const [
+    shelfMessage,
+    setShelfMessage,
+  ] = useState('')
+
   useEffect(() => {
     saveBooksToStorage(
       myBooks
     )
   }, [myBooks])
 
-  async function searchBooks() {
-    if (!query.trim()) {
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadCustomShelves() {
+      if (!user?.id) {
+        return
+      }
+
+      try {
+        const [
+          shelvesResult,
+          shelfBooksResult,
+        ] =
+          await Promise.all([
+            supabase
+              .from(
+                'custom_shelves'
+              )
+              .select(
+                'id, name, created_at'
+              )
+              .eq(
+                'user_id',
+                user.id
+              )
+              .order(
+                'created_at',
+                {
+                  ascending:
+                    true,
+                }
+              ),
+
+            supabase
+              .from(
+                'custom_shelf_books'
+              )
+              .select(
+                'id, shelf_id, book_key, created_at'
+              )
+              .eq(
+                'user_id',
+                user.id
+              ),
+          ])
+
+        if (
+          shelvesResult.error
+        ) {
+          throw (
+            shelvesResult.error
+          )
+        }
+
+        if (
+          shelfBooksResult.error
+        ) {
+          throw (
+            shelfBooksResult.error
+          )
+        }
+
+        if (!cancelled) {
+          setCustomShelves(
+            shelvesResult.data ||
+            []
+          )
+
+          setCustomShelfBooks(
+            shelfBooksResult.data ||
+            []
+          )
+        }
+      } catch (error) {
+        console.error(
+          'Could not load custom shelves:',
+          error
+        )
+
+        if (!cancelled) {
+          setShelfMessage(
+            'Could not load your custom shelves.'
+          )
+        }
+      }
+    }
+
+    loadCustomShelves()
+
+    return () => {
+      cancelled = true
+    }
+  }, [user?.id])
+
+  async function searchBooks(
+    searchTerm = query,
+    signal
+  ) {
+    const cleanQuery =
+      searchTerm.trim()
+
+    if (
+      cleanQuery.length < 2
+    ) {
+      setResults([])
+      setLoading(false)
       return
     }
 
     setLoading(true)
-    setResults([])
 
     try {
       const response =
         await fetch(
           `https://openlibrary.org/search.json?q=${encodeURIComponent(
-            query
-          )}&limit=8`
+            cleanQuery
+          )}&limit=8`,
+          {
+            signal,
+          }
         )
+
+      if (!response.ok) {
+        throw new Error(
+          'Search failed'
+        )
+      }
 
       const data =
         await response.json()
@@ -2183,14 +3580,56 @@ function MyBooksPage() {
         data.docs || []
       )
     } catch (error) {
-      console.error(
-        'Error searching books:',
-        error
-      )
+      if (
+        error.name !==
+        'AbortError'
+      ) {
+        console.error(
+          'Error searching books:',
+          error
+        )
+      }
     } finally {
-      setLoading(false)
+      if (
+        !signal?.aborted
+      ) {
+        setLoading(false)
+      }
     }
   }
+
+  useEffect(() => {
+    const cleanQuery =
+      query.trim()
+
+    if (
+      !showAddBook ||
+      cleanQuery.length < 2
+    ) {
+      setResults([])
+      setLoading(false)
+      return
+    }
+
+    const controller =
+      new AbortController()
+
+    const timer =
+      setTimeout(() => {
+        searchBooks(
+          cleanQuery,
+          controller.signal
+        )
+      }, 350)
+
+    return () => {
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }, [
+    query,
+    showAddBook,
+  ])
 
   function openDiscovery(book) {
     const discoveryBook = {
@@ -2291,6 +3730,16 @@ function MyBooksPage() {
         newBook,
       ]
     )
+
+    createActivity(
+      user?.id,
+      'want_to_read',
+      newBook,
+      {
+        shelf:
+          'Want to Read',
+      }
+    )
   }
 
   function removeBook(
@@ -2309,6 +3758,38 @@ function MyBooksPage() {
     bookKey,
     shelf
   ) {
+    const previousBook =
+      myBooks.find(
+        (book) =>
+          book.key ===
+          bookKey
+      )
+
+    if (
+      previousBook &&
+      previousBook.shelf !==
+        shelf
+    ) {
+      const activityType =
+        activityTypeForShelf(
+          shelf
+        )
+
+      if (activityType) {
+        createActivity(
+          user?.id,
+          activityType,
+          {
+            ...previousBook,
+            shelf,
+          },
+          {
+            shelf,
+          }
+        )
+      }
+    }
+
     setMyBooks((books) =>
       books.map((book) => {
         if (
@@ -2423,6 +3904,383 @@ function MyBooksPage() {
     )
   }
 
+  async function createCustomShelf() {
+    const cleanName =
+      newShelfName.trim()
+
+    if (
+      !user?.id ||
+      !cleanName
+    ) {
+      return
+    }
+
+    if (
+      customShelves.some(
+        (shelf) =>
+          shelf.name
+            .toLowerCase() ===
+          cleanName
+            .toLowerCase()
+      )
+    ) {
+      setShelfMessage(
+        'You already have a shelf with that name.'
+      )
+
+      return
+    }
+
+    setShelfSaving(true)
+    setShelfMessage('')
+
+    try {
+      const {
+        data,
+        error,
+      } =
+        await supabase
+          .from(
+            'custom_shelves'
+          )
+          .insert({
+            user_id:
+              user.id,
+
+            name:
+              cleanName,
+          })
+          .select(
+            'id, name, created_at'
+          )
+          .single()
+
+      if (error) {
+        throw error
+      }
+
+      setCustomShelves(
+        (current) => [
+          ...current,
+          data,
+        ]
+      )
+
+      setNewShelfName('')
+
+      setShelfMessage(
+        `Created "${cleanName}".`
+      )
+    } catch (error) {
+      console.error(
+        'Could not create custom shelf:',
+        error
+      )
+
+      setShelfMessage(
+        'Could not create that shelf.'
+      )
+    } finally {
+      setShelfSaving(false)
+    }
+  }
+
+  async function renameCustomShelf(
+    shelf
+  ) {
+    const nextName =
+      window.prompt(
+        'Rename shelf',
+        shelf.name
+      )
+
+    if (nextName === null) {
+      return
+    }
+
+    const cleanName =
+      nextName.trim()
+
+    if (
+      !cleanName ||
+      cleanName ===
+        shelf.name
+    ) {
+      return
+    }
+
+    try {
+      const {
+        data,
+        error,
+      } =
+        await supabase
+          .from(
+            'custom_shelves'
+          )
+          .update({
+            name:
+              cleanName,
+          })
+          .eq(
+            'id',
+            shelf.id
+          )
+          .eq(
+            'user_id',
+            user.id
+          )
+          .select(
+            'id, name, created_at'
+          )
+          .single()
+
+      if (error) {
+        throw error
+      }
+
+      setCustomShelves(
+        (current) =>
+          current.map(
+            (item) =>
+              item.id ===
+              shelf.id
+                ? data
+                : item
+          )
+      )
+
+      setShelfMessage(
+        `Renamed to "${cleanName}".`
+      )
+    } catch (error) {
+      console.error(
+        'Could not rename custom shelf:',
+        error
+      )
+
+      setShelfMessage(
+        'Could not rename that shelf.'
+      )
+    }
+  }
+
+  async function deleteCustomShelf(
+    shelf
+  ) {
+    const confirmed =
+      window.confirm(
+        `Delete "${shelf.name}"? The books will stay in your library.`
+      )
+
+    if (!confirmed) {
+      return
+    }
+
+    try {
+      const {
+        error,
+      } =
+        await supabase
+          .from(
+            'custom_shelves'
+          )
+          .delete()
+          .eq(
+            'id',
+            shelf.id
+          )
+          .eq(
+            'user_id',
+            user.id
+          )
+
+      if (error) {
+        throw error
+      }
+
+      setCustomShelves(
+        (current) =>
+          current.filter(
+            (item) =>
+              item.id !==
+              shelf.id
+          )
+      )
+
+      setCustomShelfBooks(
+        (current) =>
+          current.filter(
+            (item) =>
+              item.shelf_id !==
+              shelf.id
+          )
+      )
+
+      if (
+        activeShelf ===
+        `custom:${shelf.id}`
+      ) {
+        setActiveShelf(
+          'All'
+        )
+      }
+
+      setShelfMessage(
+        `Deleted "${shelf.name}".`
+      )
+    } catch (error) {
+      console.error(
+        'Could not delete custom shelf:',
+        error
+      )
+
+      setShelfMessage(
+        'Could not delete that shelf.'
+      )
+    }
+  }
+
+  async function addBookToCustomShelf(
+    bookKey,
+    shelfId
+  ) {
+    if (
+      !user?.id ||
+      !bookKey ||
+      !shelfId
+    ) {
+      return
+    }
+
+    const exists =
+      customShelfBooks.some(
+        (item) =>
+          item.shelf_id ===
+            shelfId &&
+          item.book_key ===
+            bookKey
+      )
+
+    if (exists) {
+      return
+    }
+
+    try {
+      const {
+        data,
+        error,
+      } =
+        await supabase
+          .from(
+            'custom_shelf_books'
+          )
+          .insert({
+            shelf_id:
+              shelfId,
+
+            user_id:
+              user.id,
+
+            book_key:
+              bookKey,
+          })
+          .select(
+            'id, shelf_id, book_key, created_at'
+          )
+          .single()
+
+      if (error) {
+        throw error
+      }
+
+      setCustomShelfBooks(
+        (current) => [
+          ...current,
+          data,
+        ]
+      )
+    } catch (error) {
+      console.error(
+        'Could not add book to custom shelf:',
+        error
+      )
+    }
+  }
+
+  async function removeBookFromCustomShelf(
+    bookKey,
+    shelfId
+  ) {
+    try {
+      const {
+        error,
+      } =
+        await supabase
+          .from(
+            'custom_shelf_books'
+          )
+          .delete()
+          .eq(
+            'user_id',
+            user.id
+          )
+          .eq(
+            'shelf_id',
+            shelfId
+          )
+          .eq(
+            'book_key',
+            bookKey
+          )
+
+      if (error) {
+        throw error
+      }
+
+      setCustomShelfBooks(
+        (current) =>
+          current.filter(
+            (item) =>
+              !(
+                item.shelf_id ===
+                  shelfId &&
+                item.book_key ===
+                  bookKey
+              )
+          )
+      )
+    } catch (error) {
+      console.error(
+        'Could not remove book from custom shelf:',
+        error
+      )
+    }
+  }
+
+  function customShelvesForBook(
+    bookKey
+  ) {
+    const shelfIds =
+      customShelfBooks
+        .filter(
+          (item) =>
+            item.book_key ===
+            bookKey
+        )
+        .map(
+          (item) =>
+            item.shelf_id
+        )
+
+    return customShelves.filter(
+      (shelf) =>
+        shelfIds.includes(
+          shelf.id
+        )
+    )
+  }
+
   const filteredBooks =
     myBooks.filter(
       (book) => {
@@ -2440,6 +4298,26 @@ function MyBooksPage() {
           return book.favorite
         }
 
+        if (
+          activeShelf.startsWith(
+            'custom:'
+          )
+        ) {
+          const shelfId =
+            activeShelf.replace(
+              'custom:',
+              ''
+            )
+
+          return customShelfBooks.some(
+            (item) =>
+              item.shelf_id ===
+                shelfId &&
+              item.book_key ===
+                book.key
+          )
+        }
+
         return (
           book.shelf ===
           activeShelf
@@ -2449,6 +4327,7 @@ function MyBooksPage() {
 
   const shelves = [
     'All',
+    'Want to Read',
     'Currently Reading',
     'Finished',
     'Favorites',
@@ -2508,6 +4387,152 @@ function MyBooksPage() {
           )
         )}
       </div>
+
+      <section className="custom-shelves-card">
+        <div className="custom-shelves-heading">
+          <div>
+            <p className="eyebrow">
+              organize your way
+            </p>
+
+            <h3>
+              Custom Shelves
+            </h3>
+          </div>
+
+          <span>
+            A book can live on
+            more than one shelf.
+          </span>
+        </div>
+
+        <div className="custom-shelf-create">
+          <input
+            type="text"
+            value={
+              newShelfName
+            }
+            placeholder="e.g. Summer Reads"
+            maxLength={40}
+            onChange={(
+              event
+            ) => {
+              setNewShelfName(
+                event.target.value
+              )
+
+              setShelfMessage('')
+            }}
+            onKeyDown={(
+              event
+            ) => {
+              if (
+                event.key ===
+                'Enter'
+              ) {
+                createCustomShelf()
+              }
+            }}
+          />
+
+          <button
+            type="button"
+            disabled={
+              shelfSaving ||
+              !newShelfName.trim()
+            }
+            onClick={
+              createCustomShelf
+            }
+          >
+            {shelfSaving
+              ? 'Creating...'
+              : '+ New Shelf'}
+          </button>
+        </div>
+
+        {customShelves.length >
+        0 ? (
+          <div className="custom-shelf-chip-row">
+            {customShelves.map(
+              (shelf) => (
+                <div
+                  className={
+                    activeShelf ===
+                    `custom:${shelf.id}`
+                      ? 'custom-shelf-chip active'
+                      : 'custom-shelf-chip'
+                  }
+                  key={
+                    shelf.id
+                  }
+                >
+                  <button
+                    type="button"
+                    className="custom-shelf-chip-name"
+                    onClick={() =>
+                      setActiveShelf(
+                        `custom:${shelf.id}`
+                      )
+                    }
+                  >
+                    {shelf.name}
+
+                    <span>
+                      {
+                        customShelfBooks.filter(
+                          (item) =>
+                            item.shelf_id ===
+                            shelf.id
+                        ).length
+                      }
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    className="custom-shelf-chip-edit"
+                    title="Rename shelf"
+                    onClick={() =>
+                      renameCustomShelf(
+                        shelf
+                      )
+                    }
+                  >
+                    ✎
+                  </button>
+
+                  <button
+                    type="button"
+                    className="custom-shelf-chip-delete"
+                    title="Delete shelf"
+                    onClick={() =>
+                      deleteCustomShelf(
+                        shelf
+                      )
+                    }
+                  >
+                    ×
+                  </button>
+                </div>
+              )
+            )}
+          </div>
+        ) : (
+          <p className="custom-shelves-empty">
+            Create shelves for
+            moods, genres, book
+            clubs, yearly reads,
+            or anything else.
+          </p>
+        )}
+
+        {shelfMessage && (
+          <p className="custom-shelf-message">
+            {shelfMessage}
+          </p>
+        )}
+      </section>
 
       {filteredBooks.length >
       0 ? (
@@ -2635,6 +4660,104 @@ function MyBooksPage() {
                     </option>
                   </select>
 
+                  {customShelves.length >
+                    0 && (
+                    <div className="book-custom-shelves">
+                      <select
+                        className="custom-shelf-select"
+                        value=""
+                        onChange={(
+                          event
+                        ) => {
+                          const shelfId =
+                            event.target
+                              .value
+
+                          if (shelfId) {
+                            addBookToCustomShelf(
+                              book.key,
+                              shelfId
+                            )
+                          }
+
+                          event.target.value =
+                            ''
+                        }}
+                      >
+                        <option value="">
+                          + Add to custom shelf
+                        </option>
+
+                        {customShelves
+                          .filter(
+                            (shelf) =>
+                              !customShelvesForBook(
+                                book.key
+                              ).some(
+                                (
+                                  addedShelf
+                                ) =>
+                                  addedShelf.id ===
+                                  shelf.id
+                              )
+                          )
+                          .map(
+                            (shelf) => (
+                              <option
+                                value={
+                                  shelf.id
+                                }
+                                key={
+                                  shelf.id
+                                }
+                              >
+                                {
+                                  shelf.name
+                                }
+                              </option>
+                            )
+                          )}
+                      </select>
+
+                      {customShelvesForBook(
+                        book.key
+                      ).length > 0 && (
+                        <div className="book-custom-shelf-tags">
+                          {customShelvesForBook(
+                            book.key
+                          ).map(
+                            (
+                              shelf
+                            ) => (
+                              <span
+                                key={
+                                  shelf.id
+                                }
+                              >
+                                {
+                                  shelf.name
+                                }
+
+                                <button
+                                  type="button"
+                                  aria-label={`Remove from ${shelf.name}`}
+                                  onClick={() =>
+                                    removeBookFromCustomShelf(
+                                      book.key,
+                                      shelf.id
+                                    )
+                                  }
+                                >
+                                  ×
+                                </button>
+                              </span>
+                            )
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <button
                     className="remove-book-button"
                     onClick={() =>
@@ -2734,25 +4857,18 @@ function MyBooksPage() {
                   event
                 ) =>
                   setQuery(
-                    event.target
-                      .value
+                    event.target.value
                   )
                 }
-                onKeyDown={(
-                  event
-                ) => {
-                  if (
-                    event.key ===
-                    'Enter'
-                  ) {
-                    searchBooks()
-                  }
-                }}
+                autoFocus
+                autoComplete="off"
               />
 
               <button
-                onClick={
-                  searchBooks
+                onClick={() =>
+                  searchBooks(
+                    query
+                  )
                 }
               >
                 Search
@@ -2896,9 +5012,9 @@ function MyBooksPage() {
                   />
 
                   <p>
-                    Search for a
-                    book to see
-                    results here.
+                    Start typing a
+                    title or author
+                    to find books.
                   </p>
                 </div>
               )}
@@ -2957,6 +5073,11 @@ function DiscoveryBookPage({
     reviewsLoading,
     setReviewsLoading,
   ] = useState(true)
+
+  const [
+    revealedSpoilers,
+    setRevealedSpoilers,
+  ] = useState({})
 
   const [
     savedBooks,
@@ -3184,7 +5305,7 @@ function DiscoveryBookPage({
           await supabase
             .from('reviews')
             .select(
-              'id, user_id, reviewer_name, rating, review, updated_at'
+              'id, user_id, reviewer_name, rating, review, contains_spoilers, updated_at'
             )
             .eq(
               'book_key',
@@ -3206,9 +5327,15 @@ function DiscoveryBookPage({
           throw error
         }
 
+        const enrichedReviews =
+          await hydrateReviewsWithLikes(
+            data || [],
+            user?.id
+          )
+
         if (!cancelled) {
           setPublicReviews(
-            data || []
+            enrichedReviews
           )
         }
       } catch (error) {
@@ -3234,7 +5361,105 @@ function DiscoveryBookPage({
     return () => {
       cancelled = true
     }
-  }, [decodedKey])
+  }, [
+    decodedKey,
+    user?.id,
+  ])
+
+  async function toggleDiscoveryReviewLike(
+    review
+  ) {
+    if (!user?.id) {
+      return
+    }
+
+    const shouldLike =
+      !review.is_liked
+
+    setPublicReviews(
+      (current) =>
+        current.map(
+          (item) =>
+            item.id ===
+            review.id
+              ? {
+                  ...item,
+
+                  is_liked:
+                    shouldLike,
+
+                  like_count:
+                    Math.max(
+                      0,
+                      Number(
+                        item.like_count ||
+                          0
+                      ) +
+                        (
+                          shouldLike
+                            ? 1
+                            : -1
+                        )
+                    ),
+                }
+              : item
+        )
+    )
+
+    const success =
+      await setReviewLike(
+        review.id,
+        user.id,
+        shouldLike
+      )
+
+    if (!success) {
+      setPublicReviews(
+        (current) =>
+          current.map(
+            (item) =>
+              item.id ===
+              review.id
+                ? {
+                    ...item,
+
+                    is_liked:
+                      !shouldLike,
+
+                    like_count:
+                      Math.max(
+                        0,
+                        Number(
+                          item.like_count ||
+                            0
+                        ) +
+                          (
+                            shouldLike
+                              ? -1
+                              : 1
+                          )
+                      ),
+                  }
+                : item
+          )
+      )
+    }
+  }
+
+  function toggleDiscoverySpoiler(
+    reviewId
+  ) {
+    setRevealedSpoilers(
+      (current) => ({
+        ...current,
+
+        [reviewId]:
+          !current[
+            reviewId
+          ],
+      })
+    )
+  }
 
   function addToLibrary(
     shelf
@@ -3330,6 +5555,22 @@ function DiscoveryBookPage({
     saveBooksToStorage(
       updatedBooks
     )
+
+    const activityType =
+      activityTypeForShelf(
+        shelf
+      )
+
+    if (activityType) {
+      createActivity(
+        user?.id,
+        activityType,
+        newBook,
+        {
+          shelf,
+        }
+      )
+    }
 
     navigate(
       `/books/${encodeURIComponent(
@@ -3604,17 +5845,37 @@ function DiscoveryBookPage({
                 >
                   <div className="discovery-review-card-top">
                     <div className="discovery-review-avatar">
-                      {(review.reviewer_name ||
-                        'R')
-                        .charAt(0)
-                        .toUpperCase()}
+                      {review.reviewer_avatar_url ? (
+                        <img
+                          src={
+                            review.reviewer_avatar_url
+                          }
+                          alt={
+                            review.reviewer_name ||
+                            'Reader'
+                          }
+                        />
+                      ) : (
+                        (review.reviewer_name ||
+                          'R')
+                          .charAt(0)
+                          .toUpperCase()
+                      )}
                     </div>
 
                     <div className="discovery-review-person">
-                      <strong>
+                      <button
+                        type="button"
+                        className="reader-profile-link"
+                        onClick={() =>
+                          navigate(
+                            `/profile/${review.user_id}`
+                          )
+                        }
+                      >
                         {review.reviewer_name ||
                           'Reader'}
-                      </strong>
+                      </button>
 
                       {review.updated_at && (
                         <span>
@@ -3649,11 +5910,55 @@ function DiscoveryBookPage({
                   </div>
 
                   {review.review?.trim() ? (
-                    <p>
-                      {
-                        review.review
-                      }
-                    </p>
+                    review.contains_spoilers &&
+                    !revealedSpoilers[
+                      review.id
+                    ] ? (
+                      <div className="review-spoiler-cover">
+                        <span>
+                          spoiler
+                        </span>
+
+                        <p>
+                          This review
+                          contains
+                          spoilers.
+                        </p>
+
+                        <button
+                          type="button"
+                          onClick={() =>
+                            toggleDiscoverySpoiler(
+                              review.id
+                            )
+                          }
+                        >
+                          Show review
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        {review.contains_spoilers && (
+                          <button
+                            type="button"
+                            className="hide-spoiler-button"
+                            onClick={() =>
+                              toggleDiscoverySpoiler(
+                                review.id
+                              )
+                            }
+                          >
+                            Hide spoiler
+                          </button>
+                        )}
+
+                        <p className="community-review-body">
+                          {
+                            review.review
+                          }
+                        </p>
+                      </>
+                    )
                   ) : (
                     <p className="discovery-review-empty-text">
                       Rated this book
@@ -3661,6 +5966,44 @@ function DiscoveryBookPage({
                       written review.
                     </p>
                   )}
+
+                  <div className="community-review-footer">
+                    <button
+                      type="button"
+                      className={
+                        review.is_liked
+                          ? 'review-like-button liked'
+                          : 'review-like-button'
+                      }
+                      onClick={() =>
+                        toggleDiscoveryReviewLike(
+                          review
+                        )
+                      }
+                    >
+                      <Heart
+                        size={15}
+                        fill={
+                          review.is_liked
+                            ? 'currentColor'
+                            : 'none'
+                        }
+                      />
+
+                      <span>
+                        {Number(
+                          review.like_count ||
+                            0
+                        )}
+                      </span>
+                    </button>
+
+                    {review.contains_spoilers && (
+                      <span className="spoiler-badge">
+                        spoiler
+                      </span>
+                    )}
+                  </div>
                 </article>
               )
             )}
@@ -3722,6 +6065,16 @@ function BookDetailPage({ user }) {
     reviewVisibility,
     setReviewVisibility,
   ] = useState('private')
+
+  const [
+    reviewContainsSpoilers,
+    setReviewContainsSpoilers,
+  ] = useState(false)
+
+  const [
+    revealedSpoilers,
+    setRevealedSpoilers,
+  ] = useState({})
 
   const [
     publicReviews,
@@ -3836,7 +6189,7 @@ function BookDetailPage({ user }) {
           await supabase
             .from('reviews')
             .select(
-              'id, user_id, reviewer_name, book_key, book_title, book_author, rating, review, is_public, created_at, updated_at'
+              'id, user_id, reviewer_name, book_key, book_title, book_author, rating, review, is_public, contains_spoilers, created_at, updated_at'
             )
             .eq(
               'book_key',
@@ -3870,6 +6223,12 @@ function BookDetailPage({ user }) {
               : 'private'
           )
 
+          setReviewContainsSpoilers(
+            Boolean(
+              ownReview.contains_spoilers
+            )
+          )
+
           setBooks(
             (currentBooks) =>
               currentBooks.map(
@@ -3901,13 +6260,22 @@ function BookDetailPage({ user }) {
           )
         }
 
-        setPublicReviews(
+        const otherPublicReviews =
           rows.filter(
             (review) =>
               review.user_id !==
                 user.id &&
               review.is_public
           )
+
+        const enrichedReviews =
+          await hydrateReviewsWithLikes(
+            otherPublicReviews,
+            user.id
+          )
+
+        setPublicReviews(
+          enrichedReviews
         )
       } catch (error) {
         console.error(
@@ -4015,6 +6383,9 @@ function BookDetailPage({ user }) {
           reviewVisibility ===
           'public',
 
+        contains_spoilers:
+          reviewContainsSpoilers,
+
         updated_at:
           now,
       }
@@ -4041,6 +6412,30 @@ function BookDetailPage({ user }) {
           now,
       })
 
+      if (
+        reviewVisibility ===
+        'public'
+      ) {
+        createActivity(
+          user?.id,
+          'reviewed',
+          {
+            ...book,
+
+            rating:
+              Number(
+                book.rating
+              ) || 0,
+          },
+          {
+            rating:
+              Number(
+                book.rating
+              ) || 0,
+          }
+        )
+      }
+
       setReviewMessage(
         reviewVisibility ===
           'public'
@@ -4059,6 +6454,101 @@ function BookDetailPage({ user }) {
     } finally {
       setReviewSaving(false)
     }
+  }
+
+  async function toggleReaderReviewLike(
+    review
+  ) {
+    if (!user?.id) {
+      return
+    }
+
+    const shouldLike =
+      !review.is_liked
+
+    setPublicReviews(
+      (current) =>
+        current.map(
+          (item) =>
+            item.id ===
+            review.id
+              ? {
+                  ...item,
+
+                  is_liked:
+                    shouldLike,
+
+                  like_count:
+                    Math.max(
+                      0,
+                      Number(
+                        item.like_count ||
+                          0
+                      ) +
+                        (
+                          shouldLike
+                            ? 1
+                            : -1
+                        )
+                    ),
+                }
+              : item
+        )
+    )
+
+    const success =
+      await setReviewLike(
+        review.id,
+        user.id,
+        shouldLike
+      )
+
+    if (!success) {
+      setPublicReviews(
+        (current) =>
+          current.map(
+            (item) =>
+              item.id ===
+              review.id
+                ? {
+                    ...item,
+
+                    is_liked:
+                      !shouldLike,
+
+                    like_count:
+                      Math.max(
+                        0,
+                        Number(
+                          item.like_count ||
+                            0
+                        ) +
+                          (
+                            shouldLike
+                              ? -1
+                              : 1
+                          )
+                      ),
+                  }
+                : item
+          )
+      )
+    }
+  }
+
+  function toggleReaderSpoiler(
+    reviewId
+  ) {
+    setRevealedSpoilers(
+      (current) => ({
+        ...current,
+
+        [reviewId]:
+          !current[
+            reviewId
+          ],
+      })
+    )
   }
 
   function addQuote() {
@@ -4144,6 +6634,33 @@ function BookDetailPage({ user }) {
   ) {
     const today =
       todayString()
+
+    if (
+      newShelf !==
+      book.shelf
+    ) {
+      const activityType =
+        activityTypeForShelf(
+          newShelf
+        )
+
+      if (activityType) {
+        createActivity(
+          user?.id,
+          activityType,
+          {
+            ...book,
+
+            shelf:
+              newShelf,
+          },
+          {
+            shelf:
+              newShelf,
+          }
+        )
+      }
+    }
 
     if (
       newShelf ===
@@ -4981,6 +7498,43 @@ function BookDetailPage({ user }) {
               </div>
             </div>
 
+            <button
+              type="button"
+              className={
+                reviewContainsSpoilers
+                  ? 'spoiler-toggle active'
+                  : 'spoiler-toggle'
+              }
+              onClick={() => {
+                setReviewContainsSpoilers(
+                  (
+                    current
+                  ) =>
+                    !current
+                )
+
+                setReviewMessage('')
+              }}
+            >
+              <span className="spoiler-toggle-box">
+                {reviewContainsSpoilers
+                  ? '✓'
+                  : ''}
+              </span>
+
+              <span>
+                <strong>
+                  Contains spoilers
+                </strong>
+
+                <small>
+                  Other readers will
+                  have to reveal this
+                  review.
+                </small>
+              </span>
+            </button>
+
             <div className="review-save-row">
               <p className="review-save-message">
                 {reviewMessage}
@@ -5049,17 +7603,37 @@ function BookDetailPage({ user }) {
                     >
                       <div className="reader-review-top">
                         <div className="reader-review-avatar">
-                          {(review.reviewer_name ||
-                            'R')
-                            .charAt(0)
-                            .toUpperCase()}
+                          {review.reviewer_avatar_url ? (
+                            <img
+                              src={
+                                review.reviewer_avatar_url
+                              }
+                              alt={
+                                review.reviewer_name ||
+                                'Reader'
+                              }
+                            />
+                          ) : (
+                            (review.reviewer_name ||
+                              'R')
+                              .charAt(0)
+                              .toUpperCase()
+                          )}
                         </div>
 
                         <div className="reader-review-user">
-                          <strong>
+                          <button
+                            type="button"
+                            className="reader-profile-link"
+                            onClick={() =>
+                              navigate(
+                                `/profile/${review.user_id}`
+                              )
+                            }
+                          >
                             {review.reviewer_name ||
                               'Reader'}
-                          </strong>
+                          </button>
 
                           <span>
                             {review.updated_at
@@ -5098,11 +7672,55 @@ function BookDetailPage({ user }) {
                       </div>
 
                       {review.review?.trim() ? (
-                        <p className="reader-review-text">
-                          {
-                            review.review
-                          }
-                        </p>
+                        review.contains_spoilers &&
+                        !revealedSpoilers[
+                          review.id
+                        ] ? (
+                          <div className="review-spoiler-cover">
+                            <span>
+                              spoiler
+                            </span>
+
+                            <p>
+                              This review
+                              contains
+                              spoilers.
+                            </p>
+
+                            <button
+                              type="button"
+                              onClick={() =>
+                                toggleReaderSpoiler(
+                                  review.id
+                                )
+                              }
+                            >
+                              Show review
+                            </button>
+                          </div>
+                        ) : (
+                          <>
+                            {review.contains_spoilers && (
+                              <button
+                                type="button"
+                                className="hide-spoiler-button"
+                                onClick={() =>
+                                  toggleReaderSpoiler(
+                                    review.id
+                                  )
+                                }
+                              >
+                                Hide spoiler
+                              </button>
+                            )}
+
+                            <p className="reader-review-text">
+                              {
+                                review.review
+                              }
+                            </p>
+                          </>
+                        )
                       ) : (
                         <p className="reader-review-text reader-review-no-text">
                           Rated this book
@@ -5110,6 +7728,44 @@ function BookDetailPage({ user }) {
                           written review.
                         </p>
                       )}
+
+                      <div className="community-review-footer">
+                        <button
+                          type="button"
+                          className={
+                            review.is_liked
+                              ? 'review-like-button liked'
+                              : 'review-like-button'
+                          }
+                          onClick={() =>
+                            toggleReaderReviewLike(
+                              review
+                            )
+                          }
+                        >
+                          <Heart
+                            size={15}
+                            fill={
+                              review.is_liked
+                                ? 'currentColor'
+                                : 'none'
+                            }
+                          />
+
+                          <span>
+                            {Number(
+                              review.like_count ||
+                                0
+                            )}
+                          </span>
+                        </button>
+
+                        {review.contains_spoilers && (
+                          <span className="spoiler-badge">
+                            spoiler
+                          </span>
+                        )}
+                      </div>
                     </article>
                   )
                 )}
@@ -5289,6 +7945,2309 @@ function BookDetailPage({ user }) {
             </p>
           </section>
         </div>
+      </div>
+    </div>
+  )
+}
+
+
+/* =====================================================
+   PROFILE
+===================================================== */
+
+function ProfilePage({
+  user,
+}) {
+  const [
+    profile,
+    setProfile,
+  ] = useState({
+    username: '',
+    display_name:
+      user?.name || '',
+    bio: '',
+    avatar_url: '',
+    favorite_genres: [],
+  })
+
+  const [
+    draft,
+    setDraft,
+  ] = useState({
+    username: '',
+    display_name:
+      user?.name || '',
+    bio: '',
+    favorite_genres:
+      '',
+  })
+
+  const [
+    editing,
+    setEditing,
+  ] = useState(false)
+
+  const [
+    profileLoading,
+    setProfileLoading,
+  ] = useState(true)
+
+  const [
+    profileSaving,
+    setProfileSaving,
+  ] = useState(false)
+
+  const [
+    profileMessage,
+    setProfileMessage,
+  ] = useState('')
+
+  const [
+    avatarUploading,
+    setAvatarUploading,
+  ] = useState(false)
+
+  const avatarInputRef =
+    useRef(null)
+
+  const [
+    publicReviews,
+    setPublicReviews,
+  ] = useState([])
+
+  const [
+    followerCount,
+    setFollowerCount,
+  ] = useState(0)
+
+  const [
+    followingCount,
+    setFollowingCount,
+  ] = useState(0)
+
+  const [books, setBooks] =
+    useState(loadBooks)
+
+  useEffect(() => {
+    function refreshBooks() {
+      setBooks(
+        loadBooks()
+      )
+    }
+
+    window.addEventListener(
+      'booksUpdated',
+      refreshBooks
+    )
+
+    window.addEventListener(
+      'storage',
+      refreshBooks
+    )
+
+    return () => {
+      window.removeEventListener(
+        'booksUpdated',
+        refreshBooks
+      )
+
+      window.removeEventListener(
+        'storage',
+        refreshBooks
+      )
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadProfile() {
+      if (!user?.id) {
+        return
+      }
+
+      setProfileLoading(true)
+
+      try {
+        const [
+          profileResult,
+          reviewsResult,
+          followersResult,
+          followingResult,
+        ] =
+          await Promise.all([
+            supabase
+              .from(
+                'profiles'
+              )
+              .select(
+                'id, username, display_name, bio, avatar_url, favorite_genres, created_at, updated_at'
+              )
+              .eq(
+                'id',
+                user.id
+              )
+              .maybeSingle(),
+
+            supabase
+              .from(
+                'reviews'
+              )
+              .select(
+                'id, book_key, book_title, book_author, rating, review, updated_at'
+              )
+              .eq(
+                'user_id',
+                user.id
+              )
+              .eq(
+                'is_public',
+                true
+              )
+              .order(
+                'updated_at',
+                {
+                  ascending:
+                    false,
+                }
+              )
+              .limit(4),
+
+            supabase
+              .from(
+                'follows'
+              )
+              .select(
+                'id',
+                {
+                  count:
+                    'exact',
+                  head:
+                    true,
+                }
+              )
+              .eq(
+                'following_id',
+                user.id
+              ),
+
+            supabase
+              .from(
+                'follows'
+              )
+              .select(
+                'id',
+                {
+                  count:
+                    'exact',
+                  head:
+                    true,
+                }
+              )
+              .eq(
+                'follower_id',
+                user.id
+              ),
+          ])
+
+        if (
+          profileResult.error
+        ) {
+          throw (
+            profileResult.error
+          )
+        }
+
+        if (
+          reviewsResult.error
+        ) {
+          throw (
+            reviewsResult.error
+          )
+        }
+
+        if (
+          followersResult.error
+        ) {
+          throw (
+            followersResult.error
+          )
+        }
+
+        if (
+          followingResult.error
+        ) {
+          throw (
+            followingResult.error
+          )
+        }
+
+        let nextProfile =
+          profileResult.data
+
+        if (!nextProfile) {
+          const defaultUsername =
+            (user.email
+              ?.split('@')[0] ||
+              user.name ||
+              'reader')
+              .toLowerCase()
+              .replace(
+                /[^a-z0-9_]/g,
+                ''
+              )
+              .slice(
+                0,
+                24
+              )
+
+          const {
+            data,
+            error,
+          } =
+            await supabase
+              .from(
+                'profiles'
+              )
+              .upsert(
+                {
+                  id:
+                    user.id,
+
+                  username:
+                    defaultUsername ||
+                    `reader_${user.id.slice(
+                      0,
+                      6
+                    )}`,
+
+                  display_name:
+                    user.name ||
+                    'Reader',
+
+                  bio:
+                    '',
+
+                  favorite_genres:
+                    [],
+
+                  updated_at:
+                    new Date()
+                      .toISOString(),
+                },
+                {
+                  onConflict:
+                    'id',
+                }
+              )
+              .select(
+                'id, username, display_name, bio, avatar_url, favorite_genres, created_at, updated_at'
+              )
+              .single()
+
+          if (error) {
+            throw error
+          }
+
+          nextProfile =
+            data
+        }
+
+        if (cancelled) {
+          return
+        }
+
+        const cleanProfile = {
+          username:
+            nextProfile
+              ?.username ||
+            '',
+
+          display_name:
+            nextProfile
+              ?.display_name ||
+            user.name ||
+            'Reader',
+
+          bio:
+            nextProfile
+              ?.bio ||
+            '',
+
+          avatar_url:
+            nextProfile
+              ?.avatar_url ||
+            '',
+
+          favorite_genres:
+            Array.isArray(
+              nextProfile
+                ?.favorite_genres
+            )
+              ? nextProfile
+                  .favorite_genres
+              : [],
+        }
+
+        setProfile(
+          cleanProfile
+        )
+
+        setDraft({
+          username:
+            cleanProfile
+              .username,
+
+          display_name:
+            cleanProfile
+              .display_name,
+
+          bio:
+            cleanProfile.bio,
+
+          favorite_genres:
+            cleanProfile
+              .favorite_genres
+              .join(', '),
+        })
+
+        setPublicReviews(
+          reviewsResult.data ||
+          []
+        )
+
+        setFollowerCount(
+          followersResult.count ||
+          0
+        )
+
+        setFollowingCount(
+          followingResult.count ||
+          0
+        )
+      } catch (error) {
+        console.error(
+          'Error loading profile:',
+          error
+        )
+
+        if (!cancelled) {
+          setProfileMessage(
+            'Could not load your profile.'
+          )
+        }
+      } finally {
+        if (!cancelled) {
+          setProfileLoading(
+            false
+          )
+        }
+      }
+    }
+
+    loadProfile()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    user?.id,
+    user?.email,
+    user?.name,
+  ])
+
+  const finishedBooks =
+    books.filter(
+      (book) =>
+        book.shelf ===
+        'Finished'
+    )
+
+  const currentlyReading =
+    books.filter(
+      (book) =>
+        book.shelf ===
+        'Currently Reading'
+    )
+
+  const favoriteBooks =
+    books
+      .filter(
+        (book) =>
+          book.favorite
+      )
+      .slice(0, 4)
+
+  async function uploadAvatar(
+    event
+  ) {
+    const file =
+      event.target.files?.[0]
+
+    event.target.value =
+      ''
+
+    if (!file) {
+      return
+    }
+
+    if (
+      !file.type.startsWith(
+        'image/'
+      )
+    ) {
+      setProfileMessage(
+        'Please choose an image file.'
+      )
+
+      return
+    }
+
+    if (
+      file.size >
+      5 * 1024 * 1024
+    ) {
+      setProfileMessage(
+        'Profile pictures must be 5 MB or smaller.'
+      )
+
+      return
+    }
+
+    if (!user?.id) {
+      return
+    }
+
+    setAvatarUploading(
+      true
+    )
+
+    setProfileMessage('')
+
+    const avatarPath =
+      `${user.id}/avatar`
+
+    try {
+      const {
+        error:
+          uploadError,
+      } =
+        await supabase.storage
+          .from('avatars')
+          .upload(
+            avatarPath,
+            file,
+            {
+              cacheControl:
+                '3600',
+
+              upsert: true,
+
+              contentType:
+                file.type,
+            }
+          )
+
+      if (uploadError) {
+        throw uploadError
+      }
+
+      const {
+        data:
+          publicUrlData,
+      } =
+        supabase.storage
+          .from('avatars')
+          .getPublicUrl(
+            avatarPath
+          )
+
+      const baseUrl =
+        publicUrlData
+          ?.publicUrl
+
+      if (!baseUrl) {
+        throw new Error(
+          'Could not create avatar URL.'
+        )
+      }
+
+      const avatarUrl =
+        `${baseUrl}?v=${Date.now()}`
+
+      const {
+        error:
+          profileError,
+      } =
+        await supabase
+          .from('profiles')
+          .upsert(
+            {
+              id:
+                user.id,
+
+              avatar_url:
+                avatarUrl,
+
+              display_name:
+                profile.display_name ||
+                user.name ||
+                'Reader',
+
+              username:
+                profile.username ||
+                (
+                  user.email
+                    ?.split('@')[0] ||
+                  `reader_${user.id.slice(
+                    0,
+                    6
+                  )}`
+                )
+                  .toLowerCase()
+                  .replace(
+                    /[^a-z0-9_]/g,
+                    ''
+                  ),
+
+              bio:
+                profile.bio ||
+                '',
+
+              favorite_genres:
+                profile.favorite_genres ||
+                [],
+
+              updated_at:
+                new Date()
+                  .toISOString(),
+            },
+            {
+              onConflict:
+                'id',
+            }
+          )
+
+      if (profileError) {
+        throw profileError
+      }
+
+      setProfile(
+        (current) => ({
+          ...current,
+
+          avatar_url:
+            avatarUrl,
+        })
+      )
+
+      window.dispatchEvent(
+        new CustomEvent(
+          'profileUpdated',
+          {
+            detail: {
+              userId:
+                user.id,
+
+              avatarUrl,
+            },
+          }
+        )
+      )
+
+      setProfileMessage(
+        'Profile picture updated.'
+      )
+    } catch (error) {
+      console.error(
+        'Could not upload avatar:',
+        error
+      )
+
+      setProfileMessage(
+        'Could not upload your profile picture. Make sure the avatars bucket and Storage policies are set up.'
+      )
+    } finally {
+      setAvatarUploading(
+        false
+      )
+    }
+  }
+
+  async function removeAvatar() {
+    if (
+      !user?.id ||
+      !profile.avatar_url
+    ) {
+      return
+    }
+
+    setAvatarUploading(
+      true
+    )
+
+    setProfileMessage('')
+
+    const avatarPath =
+      `${user.id}/avatar`
+
+    try {
+      const {
+        error:
+          storageError,
+      } =
+        await supabase.storage
+          .from('avatars')
+          .remove([
+            avatarPath,
+          ])
+
+      if (
+        storageError
+      ) {
+        console.error(
+          'Could not remove avatar file:',
+          storageError
+        )
+      }
+
+      const {
+        error:
+          profileError,
+      } =
+        await supabase
+          .from('profiles')
+          .update({
+            avatar_url:
+              null,
+
+            updated_at:
+              new Date()
+                .toISOString(),
+          })
+          .eq(
+            'id',
+            user.id
+          )
+
+      if (profileError) {
+        throw profileError
+      }
+
+      setProfile(
+        (current) => ({
+          ...current,
+
+          avatar_url: '',
+        })
+      )
+
+      window.dispatchEvent(
+        new CustomEvent(
+          'profileUpdated',
+          {
+            detail: {
+              userId:
+                user.id,
+
+              avatarUrl:
+                '',
+            },
+          }
+        )
+      )
+
+      setProfileMessage(
+        'Profile picture removed.'
+      )
+    } catch (error) {
+      console.error(
+        'Could not remove avatar:',
+        error
+      )
+
+      setProfileMessage(
+        'Could not remove your profile picture.'
+      )
+    } finally {
+      setAvatarUploading(
+        false
+      )
+    }
+  }
+
+  async function saveProfile() {
+    if (!user?.id) {
+      return
+    }
+
+    const username =
+      draft.username
+        .trim()
+        .toLowerCase()
+        .replace(
+          /\s+/g,
+          '_'
+        )
+        .replace(
+          /[^a-z0-9_]/g,
+          ''
+        )
+
+    const displayName =
+      draft.display_name
+        .trim()
+
+    if (
+      username.length < 3
+    ) {
+      setProfileMessage(
+        'Username must be at least 3 characters.'
+      )
+
+      return
+    }
+
+    if (!displayName) {
+      setProfileMessage(
+        'Please add a display name.'
+      )
+
+      return
+    }
+
+    const genres =
+      draft.favorite_genres
+        .split(',')
+        .map(
+          (genre) =>
+            genre.trim()
+        )
+        .filter(Boolean)
+        .slice(0, 8)
+
+    setProfileSaving(true)
+    setProfileMessage('')
+
+    try {
+      const now =
+        new Date()
+          .toISOString()
+
+      const {
+        data,
+        error,
+      } =
+        await supabase
+          .from(
+            'profiles'
+          )
+          .upsert(
+            {
+              id:
+                user.id,
+
+              username,
+
+              display_name:
+                displayName,
+
+              bio:
+                draft.bio
+                  .trim(),
+
+              favorite_genres:
+                genres,
+
+              updated_at:
+                now,
+            },
+            {
+              onConflict:
+                'id',
+            }
+          )
+          .select(
+            'username, display_name, bio, avatar_url, favorite_genres'
+          )
+          .single()
+
+      if (error) {
+        throw error
+      }
+
+      const {
+        error:
+          authError,
+      } =
+        await supabase.auth
+          .updateUser({
+            data: {
+              name:
+                displayName,
+            },
+          })
+
+      if (authError) {
+        console.error(
+          'Could not update auth display name:',
+          authError
+        )
+      }
+
+      const cleanProfile = {
+        username:
+          data.username ||
+          '',
+
+        display_name:
+          data.display_name ||
+          displayName,
+
+        bio:
+          data.bio ||
+          '',
+
+        avatar_url:
+          data.avatar_url ||
+          '',
+
+        favorite_genres:
+          Array.isArray(
+            data.favorite_genres
+          )
+            ? data.favorite_genres
+            : [],
+      }
+
+      setProfile(
+        cleanProfile
+      )
+
+      setDraft({
+        username:
+          cleanProfile
+            .username,
+
+        display_name:
+          cleanProfile
+            .display_name,
+
+        bio:
+          cleanProfile.bio,
+
+        favorite_genres:
+          cleanProfile
+            .favorite_genres
+            .join(', '),
+      })
+
+      setEditing(false)
+
+      setProfileMessage(
+        'Profile saved.'
+      )
+    } catch (error) {
+      console.error(
+        'Error saving profile:',
+        error
+      )
+
+      if (
+        error?.code ===
+        '23505'
+      ) {
+        setProfileMessage(
+          'That username is already taken.'
+        )
+      } else {
+        setProfileMessage(
+          'Could not save your profile. Please try again.'
+        )
+      }
+    } finally {
+      setProfileSaving(false)
+    }
+  }
+
+  if (profileLoading) {
+    return (
+      <div className="profile-page-loading">
+        <UserRound
+          size={28}
+        />
+
+        <p>
+          Loading your profile...
+        </p>
+      </div>
+    )
+  }
+
+  const displayName =
+    profile.display_name ||
+    user?.name ||
+    'Reader'
+
+  const profileInitial =
+    displayName
+      .charAt(0)
+      .toUpperCase()
+
+  return (
+    <div className="page profile-page">
+      <section className="profile-hero-card">
+        <div className="profile-avatar-area">
+          <div className="profile-avatar-large">
+            {profile.avatar_url ? (
+              <img
+                src={
+                  profile.avatar_url
+                }
+                alt={
+                  displayName
+                }
+              />
+            ) : (
+              <span>
+                {
+                  profileInitial
+                }
+              </span>
+            )}
+          </div>
+
+          <input
+            ref={
+              avatarInputRef
+            }
+            className="avatar-file-input"
+            type="file"
+            accept="image/*"
+            onChange={
+              uploadAvatar
+            }
+          />
+
+          <div className="profile-avatar-actions">
+            <button
+              type="button"
+              disabled={
+                avatarUploading
+              }
+              onClick={() =>
+                avatarInputRef
+                  .current
+                  ?.click()
+              }
+            >
+              {avatarUploading
+                ? 'Uploading...'
+                : profile.avatar_url
+                  ? 'Change photo'
+                  : 'Add photo'}
+            </button>
+
+            {profile.avatar_url && (
+              <button
+                type="button"
+                className="profile-remove-photo"
+                disabled={
+                  avatarUploading
+                }
+                onClick={
+                  removeAvatar
+                }
+              >
+                Remove
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="profile-identity">
+          <p className="eyebrow">
+            your reading profile
+          </p>
+
+          <h1>
+            {displayName}
+          </h1>
+
+          <p className="profile-username">
+            @
+            {profile.username ||
+              'reader'}
+          </p>
+
+          {profile.bio ? (
+            <p className="profile-bio">
+              {profile.bio}
+            </p>
+          ) : (
+            <p className="profile-bio profile-bio-empty">
+              Add a little note
+              about your reading
+              life.
+            </p>
+          )}
+
+          {profile.favorite_genres
+            .length > 0 && (
+            <div className="profile-genre-row">
+              {profile.favorite_genres.map(
+                (genre) => (
+                  <span
+                    key={
+                      genre
+                    }
+                  >
+                    {genre}
+                  </span>
+                )
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="profile-hero-actions">
+          <button
+            className="profile-edit-button"
+            onClick={() => {
+              setEditing(
+                !editing
+              )
+
+              setProfileMessage(
+                ''
+              )
+            }}
+          >
+            {editing
+              ? 'Cancel'
+              : 'Edit profile'}
+          </button>
+        </div>
+      </section>
+
+      <section className="profile-stat-row">
+        <div>
+          <strong>
+            {
+              finishedBooks.length
+            }
+          </strong>
+
+          <span>
+            books read
+          </span>
+        </div>
+
+        <div>
+          <strong>
+            {
+              publicReviews.length
+            }
+          </strong>
+
+          <span>
+            public reviews
+          </span>
+        </div>
+
+        <div>
+          <strong>
+            {
+              followerCount
+            }
+          </strong>
+
+          <span>
+            followers
+          </span>
+        </div>
+
+        <div>
+          <strong>
+            {
+              followingCount
+            }
+          </strong>
+
+          <span>
+            following
+          </span>
+        </div>
+      </section>
+
+      {editing && (
+        <section className="profile-edit-card">
+          <div className="profile-section-heading">
+            <div>
+              <p className="eyebrow">
+                make it yours
+              </p>
+
+              <h2>
+                Edit Profile
+              </h2>
+            </div>
+          </div>
+
+          <div className="profile-form-grid">
+            <label>
+              Display name
+
+              <input
+                type="text"
+                value={
+                  draft.display_name
+                }
+                maxLength={50}
+                onChange={(
+                  event
+                ) =>
+                  setDraft(
+                    (
+                      current
+                    ) => ({
+                      ...current,
+
+                      display_name:
+                        event
+                          .target
+                          .value,
+                    })
+                  )
+                }
+              />
+            </label>
+
+            <label>
+              Username
+
+              <div className="profile-username-input">
+                <span>
+                  @
+                </span>
+
+                <input
+                  type="text"
+                  value={
+                    draft.username
+                  }
+                  maxLength={24}
+                  onChange={(
+                    event
+                  ) =>
+                    setDraft(
+                      (
+                        current
+                      ) => ({
+                        ...current,
+
+                        username:
+                          event
+                            .target
+                            .value,
+                      })
+                    )
+                  }
+                />
+              </div>
+            </label>
+
+            <label className="profile-form-wide">
+              Bio
+
+              <textarea
+                value={
+                  draft.bio
+                }
+                maxLength={180}
+                placeholder="Tell other readers a little about you..."
+                onChange={(
+                  event
+                ) =>
+                  setDraft(
+                    (
+                      current
+                    ) => ({
+                      ...current,
+
+                      bio:
+                        event
+                          .target
+                          .value,
+                    })
+                  )
+                }
+              />
+            </label>
+
+            <label className="profile-form-wide">
+              Favorite genres
+
+              <input
+                type="text"
+                value={
+                  draft.favorite_genres
+                }
+                placeholder="Mystery, fantasy, romance"
+                onChange={(
+                  event
+                ) =>
+                  setDraft(
+                    (
+                      current
+                    ) => ({
+                      ...current,
+
+                      favorite_genres:
+                        event
+                          .target
+                          .value,
+                    })
+                  )
+                }
+              />
+
+              <small>
+                Separate genres
+                with commas.
+              </small>
+            </label>
+          </div>
+
+          <div className="profile-save-row">
+            <p>
+              {profileMessage}
+            </p>
+
+            <button
+              disabled={
+                profileSaving
+              }
+              onClick={
+                saveProfile
+              }
+            >
+              {profileSaving
+                ? 'Saving...'
+                : 'Save profile'}
+            </button>
+          </div>
+        </section>
+      )}
+
+      {!editing &&
+        profileMessage && (
+          <p className="profile-page-message">
+            {profileMessage}
+          </p>
+        )}
+
+      <div className="profile-content-grid">
+        <section className="profile-section-card profile-current-card">
+          <div className="profile-section-heading">
+            <div>
+              <p className="eyebrow">
+                on your nightstand
+              </p>
+
+              <h2>
+                Currently Reading
+              </h2>
+            </div>
+          </div>
+
+          {currentlyReading.length >
+          0 ? (
+            <div className="profile-book-strip">
+              {currentlyReading
+                .slice(0, 4)
+                .map(
+                  (book) => (
+                    <a
+                      href={`/books/${encodeURIComponent(
+                        book.key
+                      )}`}
+                      className="profile-mini-book"
+                      key={
+                        book.key
+                      }
+                    >
+                      {book.cover ? (
+                        <img
+                          src={
+                            book.cover
+                          }
+                          alt={
+                            book.title
+                          }
+                        />
+                      ) : (
+                        <div className="profile-mini-cover-empty">
+                          <BookOpen
+                            size={24}
+                          />
+                        </div>
+                      )}
+
+                      <strong>
+                        {
+                          book.title
+                        }
+                      </strong>
+
+                      <span>
+                        {
+                          book.author
+                        }
+                      </span>
+                    </a>
+                  )
+                )}
+            </div>
+          ) : (
+            <div className="profile-empty-state">
+              <BookOpen
+                size={25}
+              />
+
+              <p>
+                Nothing in progress
+                right now.
+              </p>
+            </div>
+          )}
+        </section>
+
+        <section className="profile-section-card profile-favorites-card">
+          <div className="profile-section-heading">
+            <div>
+              <p className="eyebrow">
+                your top shelf
+              </p>
+
+              <h2>
+                Favorite Books
+              </h2>
+            </div>
+          </div>
+
+          {favoriteBooks.length >
+          0 ? (
+            <div className="profile-favorite-grid">
+              {favoriteBooks.map(
+                (book) => (
+                  <a
+                    href={`/books/${encodeURIComponent(
+                      book.key
+                    )}`}
+                    className="profile-favorite-book"
+                    key={
+                      book.key
+                    }
+                  >
+                    {book.cover ? (
+                      <img
+                        src={
+                          book.cover
+                        }
+                        alt={
+                          book.title
+                        }
+                      />
+                    ) : (
+                      <div className="profile-favorite-cover-empty">
+                        <BookOpen
+                          size={24}
+                        />
+                      </div>
+                    )}
+                  </a>
+                )
+              )}
+            </div>
+          ) : (
+            <div className="profile-empty-state">
+              <Heart
+                size={24}
+              />
+
+              <p>
+                Heart a book to
+                feature it here.
+              </p>
+            </div>
+          )}
+        </section>
+
+        <section className="profile-section-card profile-reviews-card">
+          <div className="profile-section-heading">
+            <div>
+              <p className="eyebrow">
+                shared thoughts
+              </p>
+
+              <h2>
+                Recent Reviews
+              </h2>
+            </div>
+          </div>
+
+          {publicReviews.length >
+          0 ? (
+            <div className="profile-review-list">
+              {publicReviews.map(
+                (review) => (
+                  <article
+                    key={
+                      review.id
+                    }
+                    className="profile-review-item"
+                  >
+                    <div className="profile-review-item-top">
+                      <div>
+                        <strong>
+                          {
+                            review.book_title
+                          }
+                        </strong>
+
+                        <span>
+                          {
+                            review.book_author
+                          }
+                        </span>
+                      </div>
+
+                      <div className="profile-review-stars">
+                        {[1, 2, 3, 4, 5].map(
+                          (
+                            star
+                          ) => (
+                            <Star
+                              key={
+                                star
+                              }
+                              size={14}
+                              fill={
+                                star <=
+                                Number(
+                                  review.rating ||
+                                    0
+                                )
+                                  ? 'currentColor'
+                                  : 'none'
+                              }
+                            />
+                          )
+                        )}
+                      </div>
+                    </div>
+
+                    {review.review && (
+                      <p>
+                        {
+                          review.review
+                        }
+                      </p>
+                    )}
+                  </article>
+                )
+              )}
+            </div>
+          ) : (
+            <div className="profile-empty-state">
+              <PenLine
+                size={24}
+              />
+
+              <p>
+                Your public reviews
+                will appear here.
+              </p>
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  )
+}
+
+
+/* =====================================================
+   PUBLIC PROFILE
+===================================================== */
+
+function PublicProfilePage({
+  user,
+}) {
+  const navigate =
+    useNavigate()
+
+  const { userId } =
+    useParams()
+
+  const [
+    profile,
+    setProfile,
+  ] = useState(null)
+
+  const [
+    loading,
+    setLoading,
+  ] = useState(true)
+
+  const [
+    followLoading,
+    setFollowLoading,
+  ] = useState(false)
+
+  const [
+    isFollowing,
+    setIsFollowing,
+  ] = useState(false)
+
+  const [
+    followerCount,
+    setFollowerCount,
+  ] = useState(0)
+
+  const [
+    followingCount,
+    setFollowingCount,
+  ] = useState(0)
+
+  const [
+    publicReviews,
+    setPublicReviews,
+  ] = useState([])
+
+  const [
+    publicBooks,
+    setPublicBooks,
+  ] = useState([])
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadPublicProfile() {
+      if (!userId) {
+        return
+      }
+
+      setLoading(true)
+
+      try {
+        const [
+          profileResult,
+          reviewsResult,
+          followersResult,
+          followingResult,
+          followStateResult,
+          booksResult,
+        ] =
+          await Promise.all([
+            supabase
+              .from('profiles')
+              .select(
+                'id, username, display_name, bio, avatar_url, favorite_genres, created_at'
+              )
+              .eq(
+                'id',
+                userId
+              )
+              .maybeSingle(),
+
+            supabase
+              .from('reviews')
+              .select(
+                'id, book_key, book_title, book_author, rating, review, updated_at'
+              )
+              .eq(
+                'user_id',
+                userId
+              )
+              .eq(
+                'is_public',
+                true
+              )
+              .order(
+                'updated_at',
+                {
+                  ascending:
+                    false,
+                }
+              )
+              .limit(6),
+
+            supabase
+              .from('follows')
+              .select(
+                'id',
+                {
+                  count:
+                    'exact',
+                  head:
+                    true,
+                }
+              )
+              .eq(
+                'following_id',
+                userId
+              ),
+
+            supabase
+              .from('follows')
+              .select(
+                'id',
+                {
+                  count:
+                    'exact',
+                  head:
+                    true,
+                }
+              )
+              .eq(
+                'follower_id',
+                userId
+              ),
+
+            user?.id &&
+            user.id !== userId
+              ? supabase
+                  .from('follows')
+                  .select('id')
+                  .eq(
+                    'follower_id',
+                    user.id
+                  )
+                  .eq(
+                    'following_id',
+                    userId
+                  )
+                  .maybeSingle()
+              : Promise.resolve({
+                  data: null,
+                  error: null,
+                }),
+
+            supabase
+              .from('user_books')
+              .select(
+                'book_key, title, author, cover, shelf, favorite, rating'
+              )
+              .eq(
+                'user_id',
+                userId
+              )
+              .in(
+                'shelf',
+                [
+                  'Currently Reading',
+                  'Finished',
+                ]
+              )
+              .order(
+                'updated_at',
+                {
+                  ascending:
+                    false,
+                }
+              )
+              .limit(20),
+          ])
+
+        const errors = [
+          profileResult.error,
+          reviewsResult.error,
+          followersResult.error,
+          followingResult.error,
+          followStateResult.error,
+          booksResult.error,
+        ].filter(Boolean)
+
+        if (errors.length) {
+          throw errors[0]
+        }
+
+        if (cancelled) {
+          return
+        }
+
+        setProfile(
+          profileResult.data
+        )
+
+        setPublicReviews(
+          reviewsResult.data ||
+          []
+        )
+
+        setFollowerCount(
+          followersResult.count ||
+          0
+        )
+
+        setFollowingCount(
+          followingResult.count ||
+          0
+        )
+
+        setIsFollowing(
+          Boolean(
+            followStateResult.data
+          )
+        )
+
+        setPublicBooks(
+          booksResult.data ||
+          []
+        )
+      } catch (error) {
+        console.error(
+          'Error loading public profile:',
+          error
+        )
+      } finally {
+        if (!cancelled) {
+          setLoading(false)
+        }
+      }
+    }
+
+    loadPublicProfile()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    userId,
+    user?.id,
+  ])
+
+  async function toggleFollow() {
+    if (
+      !user?.id ||
+      !userId ||
+      user.id === userId
+    ) {
+      return
+    }
+
+    setFollowLoading(true)
+
+    try {
+      if (isFollowing) {
+        const {
+          error,
+        } =
+          await supabase
+            .from('follows')
+            .delete()
+            .eq(
+              'follower_id',
+              user.id
+            )
+            .eq(
+              'following_id',
+              userId
+            )
+
+        if (error) {
+          throw error
+        }
+
+        setIsFollowing(false)
+
+        setFollowerCount(
+          (count) =>
+            Math.max(
+              0,
+              count - 1
+            )
+        )
+      } else {
+        const {
+          error,
+        } =
+          await supabase
+            .from('follows')
+            .insert({
+              follower_id:
+                user.id,
+
+              following_id:
+                userId,
+            })
+
+        if (error) {
+          throw error
+        }
+
+        setIsFollowing(true)
+
+        setFollowerCount(
+          (count) =>
+            count + 1
+        )
+      }
+    } catch (error) {
+      console.error(
+        'Error updating follow:',
+        error
+      )
+    } finally {
+      setFollowLoading(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="profile-page-loading">
+        <UserRound
+          size={28}
+        />
+
+        <p>
+          Loading reader...
+        </p>
+      </div>
+    )
+  }
+
+  if (!profile) {
+    return (
+      <div className="empty-page-card">
+        <UserRound
+          size={34}
+        />
+
+        <h3>
+          Reader not found
+        </h3>
+
+        <p>
+          This Pagelette profile
+          is unavailable.
+        </p>
+      </div>
+    )
+  }
+
+  const displayName =
+    profile.display_name ||
+    profile.username ||
+    'Reader'
+
+  const initial =
+    displayName
+      .charAt(0)
+      .toUpperCase()
+
+  const currentlyReading =
+    publicBooks.filter(
+      (book) =>
+        book.shelf ===
+        'Currently Reading'
+    )
+
+  const favoriteBooks =
+    publicBooks
+      .filter(
+        (book) =>
+          book.favorite
+      )
+      .slice(0, 4)
+
+  return (
+    <div className="page public-profile-page">
+      <button
+        className="detail-back-button"
+        onClick={() =>
+          navigate(-1)
+        }
+      >
+        <ArrowLeft
+          size={17}
+        />
+
+        Back
+      </button>
+
+      <section className="profile-hero-card">
+        <div className="profile-avatar-large">
+          {profile.avatar_url ? (
+            <img
+              src={
+                profile.avatar_url
+              }
+              alt={
+                displayName
+              }
+            />
+          ) : (
+            <span>
+              {initial}
+            </span>
+          )}
+        </div>
+
+        <div className="profile-identity">
+          <p className="eyebrow">
+            Pagelette reader
+          </p>
+
+          <h1>
+            {displayName}
+          </h1>
+
+          <p className="profile-username">
+            @
+            {profile.username ||
+              'reader'}
+          </p>
+
+          {profile.bio && (
+            <p className="profile-bio">
+              {profile.bio}
+            </p>
+          )}
+
+          {Array.isArray(
+            profile.favorite_genres
+          ) &&
+            profile.favorite_genres
+              .length > 0 && (
+              <div className="profile-genre-row">
+                {profile.favorite_genres.map(
+                  (genre) => (
+                    <span
+                      key={
+                        genre
+                      }
+                    >
+                      {genre}
+                    </span>
+                  )
+                )}
+              </div>
+            )}
+        </div>
+
+        <div className="profile-hero-actions">
+          {user?.id ===
+          userId ? (
+            <button
+              className="profile-edit-button"
+              onClick={() =>
+                navigate(
+                  '/profile'
+                )
+              }
+            >
+              View your profile
+            </button>
+          ) : (
+            <button
+              className={
+                isFollowing
+                  ? 'profile-follow-button following'
+                  : 'profile-follow-button'
+              }
+              disabled={
+                followLoading
+              }
+              onClick={
+                toggleFollow
+              }
+            >
+              {followLoading
+                ? 'Saving...'
+                : isFollowing
+                  ? 'Following'
+                  : 'Follow'}
+            </button>
+          )}
+        </div>
+      </section>
+
+      <section className="profile-stat-row">
+        <div>
+          <strong>
+            {
+              publicBooks.filter(
+                (book) =>
+                  book.shelf ===
+                  'Finished'
+              ).length
+            }
+          </strong>
+
+          <span>
+            books read
+          </span>
+        </div>
+
+        <div>
+          <strong>
+            {
+              publicReviews.length
+            }
+          </strong>
+
+          <span>
+            public reviews
+          </span>
+        </div>
+
+        <div>
+          <strong>
+            {
+              followerCount
+            }
+          </strong>
+
+          <span>
+            followers
+          </span>
+        </div>
+
+        <div>
+          <strong>
+            {
+              followingCount
+            }
+          </strong>
+
+          <span>
+            following
+          </span>
+        </div>
+      </section>
+
+      <div className="profile-content-grid">
+        <section className="profile-section-card">
+          <div className="profile-section-heading">
+            <div>
+              <p className="eyebrow">
+                currently
+              </p>
+
+              <h2>
+                Currently Reading
+              </h2>
+            </div>
+          </div>
+
+          {currentlyReading.length >
+          0 ? (
+            <div className="profile-book-strip">
+              {currentlyReading
+                .slice(0, 4)
+                .map(
+                  (book) => (
+                    <div
+                      className="profile-mini-book"
+                      key={
+                        book.book_key
+                      }
+                    >
+                      {book.cover ? (
+                        <img
+                          src={
+                            book.cover
+                          }
+                          alt={
+                            book.title
+                          }
+                        />
+                      ) : (
+                        <div className="profile-mini-cover-empty">
+                          <BookOpen
+                            size={24}
+                          />
+                        </div>
+                      )}
+
+                      <strong>
+                        {
+                          book.title
+                        }
+                      </strong>
+
+                      <span>
+                        {
+                          book.author
+                        }
+                      </span>
+                    </div>
+                  )
+                )}
+            </div>
+          ) : (
+            <div className="profile-empty-state">
+              <BookOpen
+                size={24}
+              />
+
+              <p>
+                Nothing in progress
+                right now.
+              </p>
+            </div>
+          )}
+        </section>
+
+        <section className="profile-section-card">
+          <div className="profile-section-heading">
+            <div>
+              <p className="eyebrow">
+                favorites
+              </p>
+
+              <h2>
+                Favorite Books
+              </h2>
+            </div>
+          </div>
+
+          {favoriteBooks.length >
+          0 ? (
+            <div className="profile-favorite-grid">
+              {favoriteBooks.map(
+                (book) => (
+                  <div
+                    className="profile-favorite-book"
+                    key={
+                      book.book_key
+                    }
+                  >
+                    {book.cover ? (
+                      <img
+                        src={
+                          book.cover
+                        }
+                        alt={
+                          book.title
+                        }
+                      />
+                    ) : (
+                      <div className="profile-favorite-cover-empty">
+                        <BookOpen
+                          size={24}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )
+              )}
+            </div>
+          ) : (
+            <div className="profile-empty-state">
+              <Heart
+                size={24}
+              />
+
+              <p>
+                No favorite books
+                yet.
+              </p>
+            </div>
+          )}
+        </section>
+
+        <section className="profile-section-card profile-reviews-card">
+          <div className="profile-section-heading">
+            <div>
+              <p className="eyebrow">
+                recent thoughts
+              </p>
+
+              <h2>
+                Public Reviews
+              </h2>
+            </div>
+          </div>
+
+          {publicReviews.length >
+          0 ? (
+            <div className="profile-review-list">
+              {publicReviews.map(
+                (review) => (
+                  <article
+                    key={
+                      review.id
+                    }
+                    className="profile-review-item"
+                  >
+                    <div className="profile-review-item-top">
+                      <div>
+                        <strong>
+                          {
+                            review.book_title
+                          }
+                        </strong>
+
+                        <span>
+                          {
+                            review.book_author
+                          }
+                        </span>
+                      </div>
+
+                      <div className="profile-review-stars">
+                        {[1, 2, 3, 4, 5].map(
+                          (
+                            star
+                          ) => (
+                            <Star
+                              key={
+                                star
+                              }
+                              size={14}
+                              fill={
+                                star <=
+                                Number(
+                                  review.rating ||
+                                    0
+                                )
+                                  ? 'currentColor'
+                                  : 'none'
+                              }
+                            />
+                          )
+                        )}
+                      </div>
+                    </div>
+
+                    {review.review && (
+                      <p>
+                        {
+                          review.review
+                        }
+                      </p>
+                    )}
+                  </article>
+                )
+              )}
+            </div>
+          ) : (
+            <div className="profile-empty-state">
+              <PenLine
+                size={24}
+              />
+
+              <p>
+                No public reviews
+                yet.
+              </p>
+            </div>
+          )}
+        </section>
       </div>
     </div>
   )
@@ -6058,9 +11017,46 @@ function QuotesPage() {
    STATS
 ===================================================== */
 
-function StatsPage() {
+function StatsPage({
+  user,
+}) {
   const [books] =
     useState(loadBooks)
+
+  const currentYear =
+    new Date()
+      .getFullYear()
+
+  const availableYears =
+    Array.from(
+      new Set(
+        [
+          currentYear,
+          ...books
+            .map(
+              (book) =>
+                book.finishedDate
+                  ? new Date(
+                      `${book.finishedDate}T00:00:00`
+                    )
+                      .getFullYear()
+                  : null
+            )
+            .filter(Boolean),
+        ]
+      )
+    ).sort(
+      (a, b) =>
+        b - a
+    )
+
+  const [
+    recapYear,
+    setRecapYear,
+  ] = useState(
+    availableYears[0] ||
+    currentYear
+  )
 
   const finishedBooks =
     books.filter(
@@ -6223,7 +11219,7 @@ function StatsPage() {
 
               return (
                 date.getFullYear() ===
-                  2026 &&
+                  recapYear &&
                 date.getMonth() ===
                   index
               )
@@ -6245,6 +11241,648 @@ function StatsPage() {
       ),
       1
     )
+
+  const recapBooks =
+    books.filter(
+      (book) => {
+        if (
+          !book.finishedDate
+        ) {
+          return false
+        }
+
+        const date =
+          new Date(
+            `${book.finishedDate}T00:00:00`
+          )
+
+        return (
+          date.getFullYear() ===
+          recapYear
+        )
+      }
+    )
+
+  const recapPages =
+    recapBooks.reduce(
+      (total, book) =>
+        total +
+        (
+          Number(
+            book.totalPages
+          ) ||
+          Number(
+            book.pagesRead
+          ) ||
+          0
+        ),
+      0
+    )
+
+  const recapRatedBooks =
+    recapBooks.filter(
+      (book) =>
+        Number(
+          book.rating
+        ) > 0
+    )
+
+  const recapAverageRating =
+    recapRatedBooks.length > 0
+      ? (
+          recapRatedBooks.reduce(
+            (
+              total,
+              book
+            ) =>
+              total +
+              Number(
+                book.rating
+              ),
+            0
+          ) /
+          recapRatedBooks.length
+        ).toFixed(1)
+      : '0.0'
+
+  const booksWithDuration =
+    recapBooks
+      .map(
+        (book) => {
+          if (
+            !book.startedDate ||
+            !book.finishedDate
+          ) {
+            return null
+          }
+
+          const startDate =
+            new Date(
+              `${book.startedDate}T00:00:00`
+            )
+
+          const finishDate =
+            new Date(
+              `${book.finishedDate}T00:00:00`
+            )
+
+          const days =
+            Math.max(
+              1,
+              Math.round(
+                (
+                  finishDate -
+                  startDate
+                ) /
+                  (
+                    1000 *
+                    60 *
+                    60 *
+                    24
+                  )
+              ) + 1
+            )
+
+          return {
+            book,
+            days,
+          }
+        }
+      )
+      .filter(Boolean)
+
+  const recapAverageDays =
+    booksWithDuration.length >
+    0
+      ? Math.round(
+          booksWithDuration.reduce(
+            (
+              total,
+              item
+            ) =>
+              total +
+              item.days,
+            0
+          ) /
+            booksWithDuration.length
+        )
+      : 0
+
+  const fastestRead =
+    booksWithDuration.length >
+    0
+      ? [...booksWithDuration]
+          .sort(
+            (a, b) =>
+              a.days -
+              b.days
+          )[0]
+      : null
+
+  const longestRead =
+    booksWithDuration.length >
+    0
+      ? [...booksWithDuration]
+          .sort(
+            (a, b) =>
+              b.days -
+              a.days
+          )[0]
+      : null
+
+  const highestRatedBook =
+    recapRatedBooks.length >
+    0
+      ? [...recapRatedBooks]
+          .sort(
+            (a, b) => {
+              const ratingDifference =
+                Number(
+                  b.rating
+                ) -
+                Number(
+                  a.rating
+                )
+
+              if (
+                ratingDifference !==
+                0
+              ) {
+                return (
+                  ratingDifference
+                )
+              }
+
+              return (
+                Number(
+                  b.totalPages ||
+                    b.pagesRead ||
+                    0
+                ) -
+                Number(
+                  a.totalPages ||
+                    a.pagesRead ||
+                    0
+                )
+              )
+            }
+          )[0]
+      : null
+
+  const longestBook =
+    recapBooks.length >
+    0
+      ? [...recapBooks]
+          .sort(
+            (a, b) =>
+              Number(
+                b.totalPages ||
+                  b.pagesRead ||
+                  0
+              ) -
+              Number(
+                a.totalPages ||
+                  a.pagesRead ||
+                  0
+              )
+          )[0]
+      : null
+
+  const recapFavorites =
+    recapBooks
+      .filter(
+        (book) =>
+          book.favorite
+      )
+      .slice(0, 4)
+
+  const bestMonth =
+    [...finishedByMonth]
+      .sort(
+        (a, b) =>
+          b.count -
+          a.count
+      )[0]
+
+  const displayName =
+    user?.name ||
+    'Reader'
+
+  function recapText() {
+    const favoriteLine =
+      highestRatedBook
+        ? `Top read: ${highestRatedBook.title} (${Number(
+            highestRatedBook.rating
+          ).toFixed(
+            Number(
+              highestRatedBook.rating
+            ) % 1 ===
+              0
+              ? 0
+              : 1
+          )}★)`
+        : 'Top read: still waiting for a favorite'
+
+    return [
+      `${displayName}'s ${recapYear} Pagelette Reading Recap`,
+      `${recapBooks.length} books finished`,
+      `${recapPages.toLocaleString()} pages`,
+      `${recapAverageRating} average rating`,
+      favoriteLine,
+      'pagelette.vercel.app',
+    ].join('\n')
+  }
+
+  async function shareRecap() {
+    const text =
+      recapText()
+
+    if (
+      navigator.share
+    ) {
+      try {
+        await navigator.share({
+          title:
+            `${recapYear} Pagelette Reading Recap`,
+
+          text,
+        })
+
+        return
+      } catch (error) {
+        if (
+          error?.name ===
+          'AbortError'
+        ) {
+          return
+        }
+      }
+    }
+
+    try {
+      await navigator.clipboard
+        .writeText(
+          text
+        )
+
+      window.alert(
+        'Your recap was copied to your clipboard.'
+      )
+    } catch {
+      window.alert(
+        text
+      )
+    }
+  }
+
+  function escapeXml(
+    value
+  ) {
+    return String(
+      value ?? ''
+    )
+      .replaceAll(
+        '&',
+        '&amp;'
+      )
+      .replaceAll(
+        '<',
+        '&lt;'
+      )
+      .replaceAll(
+        '>',
+        '&gt;'
+      )
+      .replaceAll(
+        '"',
+        '&quot;'
+      )
+      .replaceAll(
+        "'",
+        '&apos;'
+      )
+  }
+
+  function downloadRecap() {
+    const width =
+      1080
+
+    const height =
+      1350
+
+    const topBook =
+      highestRatedBook
+        ?.title ||
+      'Your next favorite is waiting'
+
+    const safeName =
+      escapeXml(
+        displayName
+      )
+
+    const safeBook =
+      escapeXml(
+        topBook.length > 40
+          ? `${topBook.slice(
+              0,
+              37
+            )}...`
+          : topBook
+      )
+
+    const svg = `
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width="${width}"
+        height="${height}"
+        viewBox="0 0 ${width} ${height}"
+      >
+        <rect
+          width="1080"
+          height="1350"
+          rx="0"
+          fill="#f7f4f5"
+        />
+
+        <circle
+          cx="930"
+          cy="120"
+          r="210"
+          fill="#f3d6dc"
+          opacity="0.72"
+        />
+
+        <circle
+          cx="120"
+          cy="1190"
+          r="260"
+          fill="#f8e8ec"
+          opacity="0.9"
+        />
+
+        <text
+          x="90"
+          y="115"
+          font-family="Georgia, serif"
+          font-size="46"
+          fill="#514a4e"
+        >
+          Pagelette
+        </text>
+
+        <text
+          x="90"
+          y="215"
+          font-family="Arial, sans-serif"
+          font-size="26"
+          fill="#d47c8c"
+          letter-spacing="4"
+        >
+          ${recapYear} READING RECAP
+        </text>
+
+        <text
+          x="90"
+          y="310"
+          font-family="Georgia, serif"
+          font-size="64"
+          fill="#3f393d"
+        >
+          ${safeName}
+        </text>
+
+        <text
+          x="90"
+          y="375"
+          font-family="Georgia, serif"
+          font-size="44"
+          fill="#625b60"
+        >
+          your year in books
+        </text>
+
+        <rect
+          x="90"
+          y="455"
+          width="900"
+          height="250"
+          rx="36"
+          fill="#ffffff"
+        />
+
+        <text
+          x="155"
+          y="555"
+          font-family="Georgia, serif"
+          font-size="70"
+          fill="#d67f8f"
+        >
+          ${recapBooks.length}
+        </text>
+
+        <text
+          x="155"
+          y="605"
+          font-family="Arial, sans-serif"
+          font-size="25"
+          fill="#777075"
+        >
+          books finished
+        </text>
+
+        <text
+          x="440"
+          y="555"
+          font-family="Georgia, serif"
+          font-size="70"
+          fill="#d67f8f"
+        >
+          ${recapPages.toLocaleString()}
+        </text>
+
+        <text
+          x="440"
+          y="605"
+          font-family="Arial, sans-serif"
+          font-size="25"
+          fill="#777075"
+        >
+          pages read
+        </text>
+
+        <text
+          x="770"
+          y="555"
+          font-family="Georgia, serif"
+          font-size="70"
+          fill="#d67f8f"
+        >
+          ${recapAverageRating}
+        </text>
+
+        <text
+          x="770"
+          y="605"
+          font-family="Arial, sans-serif"
+          font-size="25"
+          fill="#777075"
+        >
+          avg rating
+        </text>
+
+        <text
+          x="90"
+          y="805"
+          font-family="Arial, sans-serif"
+          font-size="24"
+          fill="#d47c8c"
+          letter-spacing="3"
+        >
+          TOP READ
+        </text>
+
+        <text
+          x="90"
+          y="880"
+          font-family="Georgia, serif"
+          font-size="48"
+          fill="#403a3e"
+        >
+          ${safeBook}
+        </text>
+
+        <text
+          x="90"
+          y="965"
+          font-family="Arial, sans-serif"
+          font-size="27"
+          fill="#756e73"
+        >
+          ${highestRatedBook
+            ? `${Number(
+                highestRatedBook.rating
+              ).toFixed(
+                Number(
+                  highestRatedBook.rating
+                ) % 1 ===
+                  0
+                  ? 0
+                  : 1
+              )} / 5 stars`
+            : 'Add ratings to reveal your top read'}
+        </text>
+
+        <text
+          x="90"
+          y="1085"
+          font-family="Arial, sans-serif"
+          font-size="25"
+          fill="#8b8388"
+        >
+          Average pace: ${recapAverageDays || 0} days per finished book
+        </text>
+
+        <text
+          x="90"
+          y="1160"
+          font-family="Arial, sans-serif"
+          font-size="25"
+          fill="#8b8388"
+        >
+          Best month: ${
+            bestMonth?.count
+              ? `${bestMonth.month} · ${bestMonth.count} books`
+              : 'keep reading'
+          }
+        </text>
+
+        <text
+          x="90"
+          y="1260"
+          font-family="Arial, sans-serif"
+          font-size="24"
+          fill="#b26d7a"
+        >
+          pagelette.vercel.app
+        </text>
+      </svg>
+    `
+
+    const blob =
+      new Blob(
+        [svg],
+        {
+          type:
+            'image/svg+xml;charset=utf-8',
+        }
+      )
+
+    const url =
+      URL.createObjectURL(
+        blob
+      )
+
+    const image =
+      new Image()
+
+    image.onload =
+      () => {
+        const canvas =
+          document.createElement(
+            'canvas'
+          )
+
+        canvas.width =
+          width
+
+        canvas.height =
+          height
+
+        const context =
+          canvas.getContext(
+            '2d'
+          )
+
+        context.drawImage(
+          image,
+          0,
+          0,
+          width,
+          height
+        )
+
+        URL.revokeObjectURL(
+          url
+        )
+
+        const png =
+          canvas.toDataURL(
+            'image/png'
+          )
+
+        const link =
+          document.createElement(
+            'a'
+          )
+
+        link.href =
+          png
+
+        link.download =
+          `pagelette-${recapYear}-reading-recap.png`
+
+        document.body
+          .appendChild(
+            link
+          )
+
+        link.click()
+
+        link.remove()
+      }
+
+    image.src = url
+  }
 
   return (
     <div className="page stats-page">
@@ -6309,6 +11947,317 @@ function StatsPage() {
         </div>
       </div>
 
+      <section className="reading-recap-section">
+        <div className="reading-recap-heading">
+          <div>
+            <p className="eyebrow">
+              your year in books
+            </p>
+
+            <h2>
+              Reading Recap
+            </h2>
+
+            <p>
+              A shareable snapshot
+              of what you read.
+            </p>
+          </div>
+
+          <select
+            value={
+              recapYear
+            }
+            onChange={(
+              event
+            ) =>
+              setRecapYear(
+                Number(
+                  event.target
+                    .value
+                )
+              )
+            }
+          >
+            {availableYears.map(
+              (year) => (
+                <option
+                  value={
+                    year
+                  }
+                  key={
+                    year
+                  }
+                >
+                  {year}
+                </option>
+              )
+            )}
+          </select>
+        </div>
+
+        <div className="reading-recap-layout">
+          <article className="reading-recap-share-card">
+            <div className="recap-card-orb recap-card-orb-one"></div>
+
+            <div className="recap-card-orb recap-card-orb-two"></div>
+
+            <div className="recap-card-top">
+              <span>
+                Pagelette
+              </span>
+
+              <small>
+                {recapYear}
+              </small>
+            </div>
+
+            <div className="recap-card-title">
+              <p>
+                {displayName}'s
+              </p>
+
+              <h3>
+                reading recap
+              </h3>
+            </div>
+
+            <div className="recap-card-number-grid">
+              <div>
+                <strong>
+                  {
+                    recapBooks.length
+                  }
+                </strong>
+
+                <span>
+                  books
+                </span>
+              </div>
+
+              <div>
+                <strong>
+                  {recapPages.toLocaleString()}
+                </strong>
+
+                <span>
+                  pages
+                </span>
+              </div>
+
+              <div>
+                <strong>
+                  {
+                    recapAverageRating
+                  }
+                </strong>
+
+                <span>
+                  avg rating
+                </span>
+              </div>
+            </div>
+
+            <div className="recap-card-feature">
+              <span>
+                top read
+              </span>
+
+              <strong>
+                {highestRatedBook
+                  ?.title ||
+                  'Your next favorite is waiting'}
+              </strong>
+
+              {highestRatedBook && (
+                <small>
+                  {Number(
+                    highestRatedBook.rating
+                  ).toFixed(
+                    Number(
+                      highestRatedBook.rating
+                    ) % 1 ===
+                      0
+                      ? 0
+                      : 1
+                  )}
+                  ★
+                </small>
+              )}
+            </div>
+
+            <div className="recap-card-footer">
+              <span>
+                {recapAverageDays ||
+                  0}{' '}
+                avg days / book
+              </span>
+
+              <span>
+                pagelette
+              </span>
+            </div>
+          </article>
+
+          <div className="reading-recap-details">
+            <div className="recap-detail-grid">
+              <div>
+                <span>
+                  Fastest Read
+                </span>
+
+                <strong>
+                  {fastestRead
+                    ? `${fastestRead.days} days`
+                    : '—'}
+                </strong>
+
+                <small>
+                  {fastestRead
+                    ?.book
+                    ?.title ||
+                    'Add reading dates'}
+                </small>
+              </div>
+
+              <div>
+                <span>
+                  Longest Read
+                </span>
+
+                <strong>
+                  {longestRead
+                    ? `${longestRead.days} days`
+                    : '—'}
+                </strong>
+
+                <small>
+                  {longestRead
+                    ?.book
+                    ?.title ||
+                    'Add reading dates'}
+                </small>
+              </div>
+
+              <div>
+                <span>
+                  Longest Book
+                </span>
+
+                <strong>
+                  {longestBook
+                    ? `${Number(
+                        longestBook.totalPages ||
+                          longestBook.pagesRead ||
+                          0
+                      ).toLocaleString()} pages`
+                    : '—'}
+                </strong>
+
+                <small>
+                  {longestBook
+                    ?.title ||
+                    'No finished books yet'}
+                </small>
+              </div>
+
+              <div>
+                <span>
+                  Best Month
+                </span>
+
+                <strong>
+                  {bestMonth?.count
+                    ? bestMonth.month
+                    : '—'}
+                </strong>
+
+                <small>
+                  {bestMonth?.count
+                    ? `${bestMonth.count} ${
+                        bestMonth.count ===
+                        1
+                          ? 'book'
+                          : 'books'
+                      } finished`
+                    : 'Keep reading'}
+                </small>
+              </div>
+            </div>
+
+            <div className="recap-actions">
+              <button
+                type="button"
+                className="recap-download-button"
+                onClick={
+                  downloadRecap
+                }
+              >
+                Download recap
+              </button>
+
+              <button
+                type="button"
+                className="recap-share-button"
+                onClick={
+                  shareRecap
+                }
+              >
+                Share recap
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {recapFavorites.length >
+          0 && (
+          <div className="recap-favorites">
+            <div>
+              <p className="eyebrow">
+                favorites from
+                {` ${recapYear}`}
+              </p>
+
+              <h3>
+                Books You Loved
+              </h3>
+            </div>
+
+            <div className="recap-favorite-covers">
+              {recapFavorites.map(
+                (book) => (
+                  <div
+                    key={
+                      book.key
+                    }
+                    title={
+                      book.title
+                    }
+                  >
+                    {book.cover ? (
+                      <img
+                        src={
+                          book.cover
+                        }
+                        alt={
+                          book.title
+                        }
+                      />
+                    ) : (
+                      <div className="recap-favorite-empty">
+                        <BookOpen
+                          size={20}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )
+              )}
+            </div>
+          </div>
+        )}
+      </section>
+
       <div className="stats-secondary-grid">
         <div className="stats-panel">
           <div className="stats-panel-heading">
@@ -6366,7 +12315,7 @@ function StatsPage() {
           <div className="stats-panel-heading">
             <h2>
               Little
-              Milestones 
+              Milestones
             </h2>
 
             <Bookmark size={21} />
@@ -6486,7 +12435,7 @@ function StatsPage() {
         <p className="monthly-chart-note">
           Based on the finished
           dates you save on each
-          book 
+          book
         </p>
       </div>
 
@@ -6603,6 +12552,12 @@ function App() {
         )
       }
 
+      if (currentUser) {
+        await hydrateLibraryFromCloud(
+          currentUser.id
+        )
+      }
+
       setUser(
         currentUser
       )
@@ -6643,13 +12598,31 @@ function App() {
               )
             }
 
-            setUser(
+            if (
               currentUser
-            )
+            ) {
+              setAuthLoading(
+                true
+              )
 
-            setAuthLoading(
-              false
-            )
+              void hydrateLibraryFromCloud(
+                currentUser.id
+              ).finally(() => {
+                setUser(
+                  currentUser
+                )
+
+                setAuthLoading(
+                  false
+                )
+              })
+            } else {
+              setUser(null)
+
+              setAuthLoading(
+                false
+              )
+            }
           }
         )
 
@@ -6716,7 +12689,9 @@ function App() {
         <Route
           path="/books"
           element={
-            <MyBooksPage />
+            <MyBooksPage
+              user={user}
+            />
           }
         />
 
@@ -6733,6 +12708,24 @@ function App() {
           path="/books/:bookKey"
           element={
             <BookDetailPage
+              user={user}
+            />
+          }
+        />
+
+        <Route
+          path="/profile/:userId"
+          element={
+            <PublicProfilePage
+              user={user}
+            />
+          }
+        />
+
+        <Route
+          path="/profile"
+          element={
+            <ProfilePage
               user={user}
             />
           }
@@ -6762,7 +12755,9 @@ function App() {
         <Route
           path="/stats"
           element={
-            <StatsPage />
+            <StatsPage
+              user={user}
+            />
           }
         />
       </Routes>
